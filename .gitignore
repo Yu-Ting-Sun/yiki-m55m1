@@ -1,0 +1,23 @@
+# Credentials — copy day2_config.example.h to day2_config.h and fill in
+day2_config.h
+
+# Keil build artifacts
+KEIL/Objects/
+KEIL/Listings/
+KEIL/release/
+*.uvguix.*
+
+# Backend runtime data
+backend/__pycache__/
+backend/audio_cache/
+backend/photo_store/
+backend/*.db
+backend/.env
+
+# Python
+__pycache__/
+*.pyc
+
+# OS noise
+Thumbs.db
+.DS_Store
