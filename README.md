@@ -57,7 +57,7 @@ copy day2_config.example.h day2_config.h    # 填入 Wi-Fi SSID/密碼、後端 
 但板子會連不上網 — 正式跑一定要填。`day2_config.h` 已被 git 忽略，
 憑證不會進版控。
 
-### 2. 後端（PC，與板子同一個 2.4 GHz Wi-Fi）
+### 2. 後端（PC，與板子同一個 2.4 GHz Wi-Fi；Python 3.10+）
 
 ```powershell
 cd backend
