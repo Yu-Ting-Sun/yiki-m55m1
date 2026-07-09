@@ -25,7 +25,12 @@
 #include "PerfTimer.h"
 #include "esp_at.h"
 #include "esp_http.h"
+/* Fresh clone: fall back to placeholder creds so the project still builds. */
+#if defined(__has_include) && !__has_include("day2_config.h")
+#include "day2_config.example.h"
+#else
 #include "day2_config.h"
+#endif
 #include "day2_test.h"
 
 #define STABILITY_ITERS   100

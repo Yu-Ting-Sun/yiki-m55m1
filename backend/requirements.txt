@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+litellm
+pillow
+sqlalchemy
+aiosqlite
+edge-tts

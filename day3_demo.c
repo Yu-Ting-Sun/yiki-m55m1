@@ -11,7 +11,13 @@
 
 #include "PerfTimer.h"
 #include "StoryUI.h"
+/* Fresh clone: fall back to placeholder creds so the project still builds.
+ * Copy day2_config.example.h -> day2_config.h and fill in real values. */
+#if defined(__has_include) && !__has_include("day2_config.h")
+#include "day2_config.example.h"
+#else
 #include "day2_config.h"
+#endif
 #include "esp_at.h"
 #include "esp_http.h"
 
