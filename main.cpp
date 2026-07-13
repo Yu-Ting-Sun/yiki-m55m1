@@ -65,6 +65,11 @@
 #define SLIDESHOW_DIR      "0:\\pictures"
 #define SLIDESHOW_HOLD_MS  (3000)
 
+/* Simulated face-recognition verdict, until the camera path exists: set to a
+ * user named in the album label.json files (e.g. "user1") to play only that
+ * user's albums; NULL = no filter (play everything, same as before). */
+#define SLIDESHOW_SIM_USER ((const char *)NULL)
+
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
  * 0 = Day-1 is signed off (see final_report.md): test code, boot log, tensor
@@ -421,6 +426,7 @@ int main(void)
             printf_err("Day-3 story failed (rc=%d) - running photos only\n", d3);
 
         Slideshow_ReserveRight(STORYUI_RESERVED_PX);
+        Slideshow_SetFilter(SLIDESHOW_SIM_USER);
         int slrc = Slideshow_Run(SLIDESHOW_DIR, SLIDESHOW_HOLD_MS);
         printf_err("Slideshow could not run (rc=%d) - keeping story screen\n", slrc);
         for (;;) __WFI();     /* keep whatever is on screen; demo is over */
@@ -433,6 +439,7 @@ int main(void)
      * while it has photos to show; on failure fall through to the tests. */
     if (Display_Init() == 0)
     {
+        Slideshow_SetFilter(SLIDESHOW_SIM_USER);
         int slrc = Slideshow_Run(SLIDESHOW_DIR, SLIDESHOW_HOLD_MS);
         printf_err("Slideshow could not run (rc=%d) - continuing with tests\n", slrc);
     }

@@ -341,13 +341,195 @@ static int show_bmp(const char *path, uint32_t panelW, uint32_t panelH)
 }
 
 /*----------------------------------------------------------------------------
- * Main loop
+ * Photo library — albums are the subfolders of the root, each optionally
+ * carrying a label.json ({"users": ["user1", ...]}, hand-written or later
+ * emitted by the backend). Loose files in the root form an unlabeled
+ * pseudo-album (index 0) that only plays when no filter is active, so a flat
+ * pictures/ SD card from the pre-album era keeps working unchanged.
  *--------------------------------------------------------------------------*/
-int Slideshow_Run(const char *dirPath, uint32_t holdMs)
+#define LIB_MAX_ALBUMS      (16)
+#define LIB_MAX_USERS       (8)     /* per album */
+#define LIB_NAME_LEN        (64)    /* album folder name */
+#define LIB_USER_LEN        (24)
+#define LIB_LABEL_FILE      "label.json"
+#define LIB_LABEL_MAX       (512)   /* bytes of label.json parsed */
+
+typedef struct
+{
+    char    name[LIB_NAME_LEN];     /* "" = loose files in the root */
+    char    users[LIB_MAX_USERS][LIB_USER_LEN];
+    uint8_t nUsers;
+} Album;
+
+static char    s_root[64];
+static Album   s_albums[LIB_MAX_ALBUMS];
+static uint8_t s_nAlbums;                    /* incl. pseudo-album 0 */
+
+static char    s_filter[LIB_USER_LEN];       /* "" = play everything */
+static uint8_t s_matched[LIB_MAX_ALBUMS];    /* album indices in play set */
+static uint8_t s_nMatched;
+static bool    s_restart;                    /* filter changed: reset cursor */
+
+/* Iteration state across Slideshow_ShowNext() calls. */
+static DIR     s_iterDir;
+static bool    s_iterOpen;
+static uint8_t s_cursor;                     /* index into s_matched */
+static uint8_t s_albumsDone;                 /* albums exhausted this cycle */
+static uint32_t s_shownInCycle;
+
+static bool str_ieq(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++)
+    {
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (ca != cb) return false;
+    }
+    return *a == *b;
+}
+
+/* Naive fixed-structure parser: pull the quoted strings out of the "users"
+ * array. No JSON library on this board; anything malformed just yields
+ * fewer users, never a crash. */
+static void lib_read_label(const char *dirPath, Album *al)
+{
+    char path[300], buf[LIB_LABEL_MAX + 1];
+    UINT br = 0;
+
+    al->nUsers = 0;
+
+    snprintf(path, sizeof(path), "%s\\%s", dirPath, LIB_LABEL_FILE);
+    if (f_open(&s_photoFile, path, FA_OPEN_EXISTING | FA_READ) != FR_OK)
+        return;                     /* unlabeled album: plays only unfiltered */
+    f_read(&s_photoFile, buf, LIB_LABEL_MAX, &br);
+    f_close(&s_photoFile);
+    buf[br] = 0;
+
+    const char *p = strstr(buf, "\"users\"");
+    if (!p || (p = strchr(p, '[')) == NULL) return;
+    const char *end = strchr(p, ']');
+
+    while (al->nUsers < LIB_MAX_USERS)
+    {
+        const char *q0 = strchr(p, '"');
+        if (!q0 || (end && q0 > end)) break;
+        const char *q1 = strchr(q0 + 1, '"');
+        if (!q1) break;
+
+        size_t n = (size_t)(q1 - q0) - 1u;
+        if (n >= LIB_USER_LEN) n = LIB_USER_LEN - 1;
+        memcpy(al->users[al->nUsers], q0 + 1, n);
+        al->users[al->nUsers][n] = 0;
+        al->nUsers++;
+        p = q1 + 1;
+    }
+}
+
+/* Rebuild s_matched from s_filter and flag the iterator for a restart. */
+static void lib_apply_filter(void)
+{
+    s_nMatched = 0;
+
+    for (uint8_t i = 0; i < s_nAlbums; i++)
+    {
+        if (s_filter[0] == 0)
+        {
+            s_matched[s_nMatched++] = i;    /* no filter: everything */
+            continue;
+        }
+        for (uint8_t u = 0; u < s_albums[i].nUsers; u++)
+        {
+            if (str_ieq(s_albums[i].users[u], s_filter))
+            {
+                s_matched[s_nMatched++] = i;
+                break;
+            }
+        }
+    }
+
+    if (s_filter[0] != 0 && s_nMatched == 0)
+    {
+        /* Unknown user: degrade to playing everything (same philosophy as
+         * the Wi-Fi fallback — never a black screen). */
+        printf("[SLIDESHOW] filter '%s' matches no album -> playing all\n", s_filter);
+        for (uint8_t i = 0; i < s_nAlbums; i++)
+            s_matched[s_nMatched++] = i;
+    }
+
+    s_restart = true;
+}
+
+int Slideshow_LibScan(const char *rootPath)
 {
     DIR     dir;
     FILINFO fno;
     TCHAR   drv[] = { '0', ':', 0 };
+
+    f_chdrive(drv);
+
+    strncpy(s_root, rootPath, sizeof(s_root) - 1);
+    s_root[sizeof(s_root) - 1] = 0;
+
+    /* Pseudo-album 0: loose files directly in the root, no label. */
+    s_albums[0].name[0] = 0;
+    s_albums[0].nUsers  = 0;
+    s_nAlbums = 1;
+
+    if (f_opendir(&dir, rootPath) != FR_OK)
+    {
+        printf("[SLIDESHOW] cannot open %s (folder missing on SD?)\n", rootPath);
+        s_nAlbums = 0;
+        return -1;
+    }
+
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0)
+    {
+        if (!(fno.fattrib & AM_DIR)) continue;
+
+        if (s_nAlbums >= LIB_MAX_ALBUMS)
+        {
+            printf("[SLIDESHOW] more than %d albums; extras ignored\n",
+                   LIB_MAX_ALBUMS - 1);
+            break;
+        }
+
+        Album *al = &s_albums[s_nAlbums++];
+        strncpy(al->name, fno.fname, LIB_NAME_LEN - 1);
+        al->name[LIB_NAME_LEN - 1] = 0;
+
+        char sub[300];
+        snprintf(sub, sizeof(sub), "%s\\%s", rootPath, al->name);
+        lib_read_label(sub, al);
+
+        printf("[SLIDESHOW] album '%s': %u labeled user(s)", al->name,
+               (unsigned)al->nUsers);
+        for (uint8_t u = 0; u < al->nUsers; u++)
+            printf("%s%s", u ? ", " : " [", al->users[u]);
+        printf(al->nUsers ? "]\n" : "\n");
+    }
+    f_closedir(&dir);
+
+    lib_apply_filter();             /* re-apply whatever filter is stored */
+    return (int)(s_nAlbums - 1);    /* number of real albums found */
+}
+
+int Slideshow_SetFilter(const char *user)
+{
+    if (user == NULL) user = "";
+    strncpy(s_filter, user, sizeof(s_filter) - 1);
+    s_filter[sizeof(s_filter) - 1] = 0;
+
+    if (s_nAlbums == 0) return 0;   /* not scanned yet; LibScan will apply */
+
+    lib_apply_filter();
+    printf("[SLIDESHOW] filter '%s' -> %u album(s) in play set\n",
+           s_filter[0] ? s_filter : "(none)", (unsigned)s_nMatched);
+    return (int)s_nMatched;
+}
+
+int Slideshow_ShowNext(void)
+{
+    FILINFO fno;
 
     uint32_t panelW = Disaplay_GetLCDWidth();
     uint32_t panelH = Disaplay_GetLCDHeight();
@@ -356,64 +538,86 @@ int Slideshow_Run(const char *dirPath, uint32_t holdMs)
     if (s_rightReserve < panelW)
         panelW -= s_rightReserve;
 
-    f_chdrive(drv);
+    if (s_nAlbums == 0 || s_nMatched == 0)
+        return -1;                  /* Slideshow_LibScan not run / failed */
 
-    if (f_opendir(&dir, dirPath) != FR_OK)
+    if (s_restart)
     {
-        printf("[SLIDESHOW] cannot open %s (folder missing on SD?)\n", dirPath);
-        return -1;
-    }
+        if (s_iterOpen) { f_closedir(&s_iterDir); s_iterOpen = false; }
+        s_cursor = 0;
+        s_albumsDone = 0;
+        s_shownInCycle = 0;
+        s_restart = false;
 
-    printf("[SLIDESHOW] %s -> %ux%u panel, %u ms per photo (JPG decoded on-device)\n",
-           dirPath, (unsigned)panelW, (unsigned)panelH, (unsigned)holdMs);
-
-    if (s_rightReserve == 0)
-        Display_ClearLCD(C_BLACK);
-    else
-    {
-        /* Clear only the photo region — keep the story panel intact. */
+        /* Clear the photo region so leftovers from the previous play set
+         * (larger photo, stale caption) can't linger. */
         S_DISP_RECT r = { 0, 0, panelW - 1u, panelH - 1u };
         Display_ClearRect(C_BLACK, &r);
     }
 
-    uint32_t shownThisPass = 0;
-
     for (;;)
     {
-        if (f_readdir(&dir, &fno) != FR_OK)
+        if (!s_iterOpen)
         {
-            f_closedir(&dir);
+            if (s_albumsDone >= s_nMatched)     /* full cycle completed */
+            {
+                if (s_shownInCycle == 0)
+                {
+                    printf("[SLIDESHOW] no displayable photo (.jpg/.bmp) in play set\n");
+                    return -2;
+                }
+                s_albumsDone = 0;
+                s_shownInCycle = 0;             /* wrap: loop forever */
+            }
+
+            const Album *al = &s_albums[s_matched[s_cursor]];
+            char dirPath[300];
+
+            if (al->name[0])
+                snprintf(dirPath, sizeof(dirPath), "%s\\%s", s_root, al->name);
+            else
+                snprintf(dirPath, sizeof(dirPath), "%s", s_root);
+
+            if (f_opendir(&s_iterDir, dirPath) != FR_OK)
+            {
+                s_albumsDone++;
+                s_cursor = (uint8_t)((s_cursor + 1) % s_nMatched);
+                continue;
+            }
+            s_iterOpen = true;
+        }
+
+        if (f_readdir(&s_iterDir, &fno) != FR_OK)
+        {
+            f_closedir(&s_iterDir);
+            s_iterOpen = false;
             return -3;
         }
 
-        if (fno.fname[0] == 0)                    /* end of directory */
+        if (fno.fname[0] == 0)                  /* album exhausted */
         {
-            if (shownThisPass == 0)
-            {
-                printf("[SLIDESHOW] no displayable photo (.jpg/.bmp) in %s\n", dirPath);
-                f_closedir(&dir);
-                return -2;
-            }
-            shownThisPass = 0;
-            f_readdir(&dir, NULL);                /* rewind, loop forever */
+            f_closedir(&s_iterDir);
+            s_iterOpen = false;
+            s_albumsDone++;
+            s_cursor = (uint8_t)((s_cursor + 1) % s_nMatched);
             continue;
         }
 
         if (fno.fattrib & AM_DIR) continue;
 
+        const Album *al = &s_albums[s_matched[s_cursor]];
         char path[300];
         int  rc;
 
+        if (al->name[0])
+            snprintf(path, sizeof(path), "%s\\%s\\%s", s_root, al->name, fno.fname);
+        else
+            snprintf(path, sizeof(path), "%s\\%s", s_root, fno.fname);
+
         if (name_is_jpg(fno.fname))
-        {
-            snprintf(path, sizeof(path), "%s\\%s", dirPath, fno.fname);
             rc = show_jpg(path, panelW, panelH);
-        }
         else if (name_is_bmp(fno.fname))
-        {
-            snprintf(path, sizeof(path), "%s\\%s", dirPath, fno.fname);
             rc = show_bmp(path, panelW, panelH);
-        }
         else if (name_is_png(fno.fname) || name_is_heic(fno.fname))
         {
             printf("[SLIDESHOW] skip %s (PNG/HEIC not decodable on-device; "
@@ -421,7 +625,7 @@ int Slideshow_Run(const char *dirPath, uint32_t holdMs)
             continue;
         }
         else
-            continue;   /* not a picture */
+            continue;   /* not a picture (label.json lands here too) */
 
         if (rc != 0)
         {
@@ -430,10 +634,37 @@ int Slideshow_Run(const char *dirPath, uint32_t holdMs)
         }
 
 #if SLIDE_CAPTION
-        Display_PutText(fno.fname, (uint32_t)strlen(fno.fname),
-                        4, panelH - 20, C_WHITE, C_BLACK, false, 1);
+        {
+            char caption[96];
+            if (al->name[0])
+                snprintf(caption, sizeof(caption), "%s/%s", al->name, fno.fname);
+            else
+                snprintf(caption, sizeof(caption), "%s", fno.fname);
+            Display_PutText(caption, (uint32_t)strlen(caption),
+                            4, panelH - 20, C_WHITE, C_BLACK, false, 1);
+        }
 #endif
-        shownThisPass++;
+        s_shownInCycle++;
+        return 0;
+    }
+}
+
+/*----------------------------------------------------------------------------
+ * Main loop (kept as a convenience wrapper over the step API)
+ *--------------------------------------------------------------------------*/
+int Slideshow_Run(const char *dirPath, uint32_t holdMs)
+{
+    if (Slideshow_LibScan(dirPath) < 0)
+        return -1;
+
+    printf("[SLIDESHOW] %s: %u album(s), %u ms per photo (JPG decoded on-device)\n",
+           dirPath, (unsigned)(s_nAlbums - 1), (unsigned)holdMs);
+
+    for (;;)
+    {
+        int rc = Slideshow_ShowNext();
+        if (rc != 0)
+            return rc;
         Display_Delay(holdMs);
     }
 }
