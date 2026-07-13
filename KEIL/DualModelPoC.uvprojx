@@ -310,8 +310,7 @@
                 <Size>0x150000</Size>
               </OCR_RVCT10>
             </OnChipMemories>
-            <RvctStartVector>
-            </RvctStartVector></ArmAdsMisc>
+            <RvctStartVector></RvctStartVector></ArmAdsMisc>
           <Cads>
             <interw>1</interw>
             <Optim>3</Optim>
@@ -337,7 +336,8 @@
             <v6WtE>0</v6WtE>
             <v6Rtti>0</v6Rtti>
             <VariousControls>
-              <MiscControls></MiscControls>              <Define>NVT_VECTOR_ON_FLASH, TF_LITE_STATIC_MEMORY, ARM_MATH_DSP, ARM_NPU</Define>
+              <MiscControls>
+</MiscControls>              <Define>NVT_VECTOR_ON_FLASH, TF_LITE_STATIC_MEMORY, ARM_MATH_DSP, ARM_NPU</Define>
               <Undefine>
               </Undefine><IncludePath>..\..\..\..\Library\CMSIS\Core\Include;..\..\..\..\Library\Device\Nuvoton\M55M1\Include;..\..\..\..\Library\CMSIS\DSP\Include;..\..\..\..\Library\StdDriver\inc;..\..\..\..\Library\StdDriver\inc\npu;..\..\..\..\ThirdParty\openmv\omv\imlib;..\..\..\..\ThirdParty\openmv\omv\alloc;..\..\..\..\ThirdParty\openmv\omv\common;..\..\..\..\ThirdParty\openmv\omv\Lib;..\..\..\..\ThirdParty\tflite_micro;..\..\..\..\ThirdParty\tflite_micro\_deps\tensorflow-flatbuffers-src\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\application\api\common\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\log\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\math\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\application\main\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\profiler\include;..\Device\include;..\Model\include;..\NPU\include;..\Pattern\include;..\ProfilerCounter\include;..\ByteTrack\include;..;..\..\..\..\ThirdParty\tflite_micro\_deps\tensorflow-gemlowp-src;..\..\..\..\ThirdParty\FatFs\source;..\..\..\..\ThirdParty\eigen</IncludePath>
             </VariousControls>
@@ -354,7 +354,8 @@
             <useXO>0</useXO>
             <ClangAsOpt>2</ClangAsOpt>
             <VariousControls>
-              <MiscControls></MiscControls>              <Define>
+              <MiscControls>
+</MiscControls>              <Define>
               </Define><Undefine>
               </Undefine><IncludePath>
               </IncludePath></VariousControls>
