@@ -139,8 +139,7 @@
           <bUseTDR>1</bUseTDR>
           <Flash2>BIN\UL2V8M.DLL</Flash2>
           <Flash3>"" ()</Flash3>
-          <Flash4>
-          </Flash4><pFcarmOut>
+          <Flash4></Flash4><pFcarmOut>
           </pFcarmOut><pFcarmGrp>
           </pFcarmGrp><pFcArmRoot>
           </pFcArmRoot><FcArmLst>0</FcArmLst>
