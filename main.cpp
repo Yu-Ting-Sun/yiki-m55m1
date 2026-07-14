@@ -32,6 +32,7 @@
 #include "Display.h"
 #include "Slideshow.h"
 #include "StoryUI.h"
+#include "Camera.h"
 #include "esp_probe.h"
 #include "day2_test.h"
 #include "day3_demo.h"
@@ -69,6 +70,11 @@
  * user named in the album label.json files (e.g. "user1") to play only that
  * user's albums; NULL = no filter (play everything, same as before). */
 #define SLIDESHOW_SIM_USER ((const char *)NULL)
+
+/* 1 = Phase-2: HM1055 camera preview in the bottom-right corner of the photo
+ *     region, refreshed continuously between photos. Camera init failure is
+ *     non-fatal (plain slideshow keeps running). Only affects RUN_DAY3_DEMO. */
+#define RUN_CAMERA_PREVIEW (1)
 
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
@@ -427,7 +433,45 @@ int main(void)
 
         Slideshow_ReserveRight(STORYUI_RESERVED_PX);
         Slideshow_SetFilter(SLIDESHOW_SIM_USER);
-        int slrc = Slideshow_Run(SLIDESHOW_DIR, SLIDESHOW_HOLD_MS);
+
+        int slrc;
+
+        if (Slideshow_LibScan(SLIDESHOW_DIR) < 0)
+            slrc = -1;
+        else
+        {
+#if RUN_CAMERA_PREVIEW
+            /* Preview sits in the bottom-right corner of the photo region.
+             * No camera (init fail) degrades to the plain slideshow. */
+            bool     camOk = (Camera_Init() == 0);
+            uint32_t camX  = Disaplay_GetLCDWidth() - STORYUI_RESERVED_PX - CAM_W;
+            uint32_t camY  = Disaplay_GetLCDHeight() - CAM_H;
+#endif
+
+            for (;;)
+            {
+                slrc = Slideshow_ShowNext();
+                if (slrc != 0) break;
+
+                /* Hold window: this idle time is where the camera (and later
+                 * the face-recognition inference) runs. */
+                uint32_t t0 = GetSystemTick_ms();
+
+                while ((GetSystemTick_ms() - t0) < SLIDESHOW_HOLD_MS)
+                {
+#if RUN_CAMERA_PREVIEW
+                    if (camOk)
+                    {
+                        if (Camera_PreviewTick(camX, camY) != 0)
+                            camOk = false;      /* capture died: stop trying */
+                        continue;
+                    }
+#endif
+                    Display_Delay(50);
+                }
+            }
+        }
+
         printf_err("Slideshow could not run (rc=%d) - keeping story screen\n", slrc);
         for (;;) __WFI();     /* keep whatever is on screen; demo is over */
     }

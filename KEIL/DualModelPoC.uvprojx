@@ -698,6 +698,26 @@
               <FileType>1</FileType>
               <FilePath>..\Device\Display\LCD\LCD_ILI9341.c</FilePath>
             </File>
+            <File>
+              <FileName>ImageSensor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Device\ImageSensor\ImageSensor.c</FilePath>
+            </File>
+            <File>
+              <FileName>Sensor_HM1055.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Device\ImageSensor\Sensor\Sensor_HM1055.c</FilePath>
+            </File>
+            <File>
+              <FileName>SWI2C.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Device\ImageSensor\Sensor\SWI2C.c</FilePath>
+            </File>
+            <File>
+              <FileName>Camera.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Camera.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
