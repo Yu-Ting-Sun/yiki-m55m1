@@ -33,6 +33,7 @@
 #include "Slideshow.h"
 #include "StoryUI.h"
 #include "Camera.h"
+#include "FaceDetect.hpp"
 #include "esp_probe.h"
 #include "day2_test.h"
 #include "day3_demo.h"
@@ -75,6 +76,12 @@
  *     region, refreshed continuously between photos. Camera init failure is
  *     non-fatal (plain slideshow keeps running). Only affects RUN_DAY3_DEMO. */
 #define RUN_CAMERA_PREVIEW (1)
+
+/* 1 = Phase-3: run face detection (compiled-in yolo-fastest_192_face +
+ *     DetectorPostProcessing) on each captured frame and draw the face boxes
+ *     onto the preview. Needs RUN_CAMERA_PREVIEW. Init failure is non-fatal
+ *     (preview keeps running without boxes). */
+#define RUN_FACE_DETECT    (1)
 
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
@@ -446,6 +453,11 @@ int main(void)
             bool     camOk = (Camera_Init() == 0);
             uint32_t camX  = Disaplay_GetLCDWidth() - STORYUI_RESERVED_PX - CAM_W;
             uint32_t camY  = Disaplay_GetLCDHeight() - CAM_H;
+#if RUN_FACE_DETECT
+            /* Face detection draws boxes onto the frame before it is blitted.
+             * Init failure degrades to plain preview (no boxes). */
+            bool fdOk = camOk && (FaceDetect_Init() == 0);
+#endif
 #endif
 
             for (;;)
@@ -462,8 +474,16 @@ int main(void)
 #if RUN_CAMERA_PREVIEW
                     if (camOk)
                     {
-                        if (Camera_PreviewTick(camX, camY) != 0)
+                        if (Camera_Capture() != 0)
+                        {
                             camOk = false;      /* capture died: stop trying */
+                            continue;
+                        }
+#if RUN_FACE_DETECT
+                        if (fdOk)
+                            FaceDetect_Run((uint16_t *)Camera_GetFrame(), CAM_W, CAM_H);
+#endif
+                        Camera_Blit(camX, camY);
                         continue;
                     }
 #endif

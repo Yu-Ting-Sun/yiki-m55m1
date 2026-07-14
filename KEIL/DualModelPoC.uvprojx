@@ -552,6 +552,16 @@
               <FileType>1</FileType>
               <FilePath>..\tjpgd.c</FilePath>
             </File>
+            <File>
+              <FileName>FaceDetect.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\FaceDetect.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>DetectorPostProcessing.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\DetectorPostProcessing.cpp</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -592,6 +602,16 @@
               <FileType>8</FileType>
               <FilePath>..\Model\GestureModel.cpp</FilePath>
             </File>
+            <File>
+              <FileName>NNModel.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\Model\NNModel.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>NN_Model_INT8.tflite.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\Model\NN_Model_INT8.tflite.cpp</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -616,6 +636,11 @@
               <FileName>Profiler.cc</FileName>
               <FileType>8</FileType>
               <FilePath>..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\profiler\Profiler.cc</FilePath>
+            </File>
+            <File>
+              <FileName>ImageUtils.cc</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\application\api\common\source\ImageUtils.cc</FilePath>
             </File>
           </Files>
         </Group>

@@ -37,6 +37,19 @@ int Camera_Init(void);
 int Camera_PreviewTick(uint32_t x, uint32_t y);
 
 /**
+ * @brief  Capture one frame into the internal buffer (blocking, no blit).
+ *         Split out of Camera_PreviewTick so inference (Phase 3) can run on
+ *         the frame before it is drawn.
+ * @return 0 captured; negative on capture timeout.
+ */
+int Camera_Capture(void);
+
+/**
+ * @brief  Blit the internal frame buffer to the LCD at (x, y).
+ */
+void Camera_Blit(uint32_t x, uint32_t y);
+
+/**
  * @brief  Latest captured frame (RGB565, CAM_W x CAM_H) for inference.
  */
 const uint16_t *Camera_GetFrame(void);

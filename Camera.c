@@ -44,7 +44,7 @@ int Camera_Init(void)
     return 0;
 }
 
-int Camera_PreviewTick(uint32_t x, uint32_t y)
+int Camera_Capture(void)
 {
     if (!s_camReady) return -1;
 
@@ -55,6 +55,12 @@ int Camera_PreviewTick(uint32_t x, uint32_t y)
         printf("[CAMERA] capture timeout\n");
         return -2;
     }
+    return 0;
+}
+
+void Camera_Blit(uint32_t x, uint32_t y)
+{
+    if (!s_camReady) return;
 
     S_DISP_RECT rect;
     rect.u32TopLeftX     = x;
@@ -62,6 +68,13 @@ int Camera_PreviewTick(uint32_t x, uint32_t y)
     rect.u32BottonRightX = x + CAM_W - 1u;
     rect.u32BottonRightY = y + CAM_H - 1u;
     Display_FillRect(s_camFrame, &rect, 1);
+}
+
+int Camera_PreviewTick(uint32_t x, uint32_t y)
+{
+    int rc = Camera_Capture();
+    if (rc != 0) return rc;
+    Camera_Blit(x, y);
     return 0;
 }
 
