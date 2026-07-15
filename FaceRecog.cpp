@@ -232,13 +232,17 @@ extern "C" int FaceRecog_Enroll(uint16_t *frame, int fw, int fh,
         return -3;
     }
 
+    /* Format MUST match ParserLabelVectorFromFile (Labels.cpp): a ':'-
+     * delimited line "label:v0:v1:...:vN:" — every value, including the last,
+     * is followed by ':' so the parser (which only emits a token when it finds
+     * the next ':') captures all of them. Comma separators leave fParam empty. */
     UINT bw;
     char buf[32];
     int len = snprintf(buf, sizeof(buf), "%s:", label);
     f_write(&fil, buf, len, &bw);
     for (size_t i = 0; i < emb.size(); i++)
     {
-        len = snprintf(buf, sizeof(buf), (i + 1 < emb.size()) ? "%.6f," : "%.6f", emb[i]);
+        len = snprintf(buf, sizeof(buf), "%.6f:", emb[i]);
         f_write(&fil, buf, len, &bw);
     }
     f_write(&fil, "\n", 1, &bw);
