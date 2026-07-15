@@ -38,7 +38,7 @@
 #define EMBED_REF_DIR      "0:\\faces"
 #define EMBED_REF_FILE     "0:\\faces\\embeddings.txt"
 
-#define RECOG_THRESHOLD    (0.7)
+#define RECOG_THRESHOLD    (0.6)
 #define RECOG_BOX_COLOR    (0x07E0)   /* green in RGB565 */
 #define RECOG_BOX_THICK    (2)
 
