@@ -24,6 +24,12 @@
 extern "C" {
 #endif
 
+/** @brief  A detected face box in frame (source-image) pixel coordinates. */
+typedef struct
+{
+    int x, y, w, h;
+} FaceBox;
+
 /**
  * @brief  Build the face-detection interpreter over its own tensor arena and
  *         set the arena MPU policy (cacheable WTRA, same as the BSP sample).
@@ -42,6 +48,13 @@ int FaceDetect_Init(void);
  * @return number of faces drawn (>=0), or negative on inference error.
  */
 int FaceDetect_Run(uint16_t *frameRGB565, int w, int h);
+
+/**
+ * @brief  Get the largest face box from the most recent FaceDetect_Run.
+ * @param[out] out  Filled with the largest box (by area) if any.
+ * @return 1 if a box was returned, 0 if the last run found no face.
+ */
+int FaceDetect_GetTopBox(FaceBox *out);
 
 #ifdef __cplusplus
 }

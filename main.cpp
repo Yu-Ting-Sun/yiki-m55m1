@@ -34,6 +34,7 @@
 #include "StoryUI.h"
 #include "Camera.h"
 #include "FaceDetect.hpp"
+#include "FaceRecog.hpp"
 #include "esp_probe.h"
 #include "day2_test.h"
 #include "day3_demo.h"
@@ -82,6 +83,21 @@
  *     onto the preview. Needs RUN_CAMERA_PREVIEW. Init failure is non-fatal
  *     (preview keeps running without boxes). */
 #define RUN_FACE_DETECT    (1)
+
+/* 1 = Phase-4: face recognition. On each detected face, crop -> FaceMobileNet
+ *     embedding -> cosine-match against SD references (0:\faces\embeddings.txt).
+ *     Recognised faces are re-drawn with a green box; result logged on UART.
+ *     Needs RUN_FACE_DETECT and 0:\face_mobilenet.tflite on the SD card. Init
+ *     failure is non-fatal (detection keeps running). */
+#define RUN_FACE_RECOG     (1)
+
+/* 1 = ENROLL mode: instead of recognising, capture the largest detected face,
+ *     compute its embedding and APPEND "ENROLL_LABEL:embedding" to the SD
+ *     reference file, then stop. Flash once per person (change ENROLL_LABEL),
+ *     then flash again with RUN_FACE_ENROLL=0 to recognise. Needs RUN_FACE_RECOG. */
+#define RUN_FACE_ENROLL    (0)
+#define ENROLL_LABEL       "user1"
+#define ENROLL_AVG_FRAMES  (1)   /* frames to wait for a stable face before enrolling */
 
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
@@ -457,6 +473,37 @@ int main(void)
             /* Face detection draws boxes onto the frame before it is blitted.
              * Init failure degrades to plain preview (no boxes). */
             bool fdOk = camOk && (FaceDetect_Init() == 0);
+#if RUN_FACE_RECOG
+            bool frOk = fdOk && (FaceRecog_Init() == 0);
+#endif
+#if RUN_FACE_ENROLL
+            bool enrolled  = false;
+            int  enrollSeen = 0;
+#endif
+            /* Single combined arena MPU setup (cacheable WTRA): the BSP
+             * configures all app MPU regions in ONE InitPreDefMPURegion call,
+             * so both arenas are set together here rather than per module. */
+            if (fdOk)
+            {
+                ARM_MPU_Region_t rg[2];
+                uint32_t nrg = 0;
+                void    *aBase; uint32_t aSize;
+
+                FaceDetect_GetArena(&aBase, &aSize);
+                rg[nrg].RBAR = ARM_MPU_RBAR((unsigned int)aBase, ARM_MPU_SH_NON, 0, 1, 1);
+                rg[nrg].RLAR = ARM_MPU_RLAR((unsigned int)aBase + aSize - 1, eMPU_ATTR_CACHEABLE_WTRA);
+                nrg++;
+#if RUN_FACE_RECOG
+                if (frOk)
+                {
+                    FaceRecog_GetArena(&aBase, &aSize);
+                    rg[nrg].RBAR = ARM_MPU_RBAR((unsigned int)aBase, ARM_MPU_SH_NON, 0, 1, 1);
+                    rg[nrg].RLAR = ARM_MPU_RLAR((unsigned int)aBase + aSize - 1, eMPU_ATTR_CACHEABLE_WTRA);
+                    nrg++;
+                }
+#endif
+                InitPreDefMPURegion(&rg[0], nrg);
+            }
 #endif
 #endif
 
@@ -479,9 +526,30 @@ int main(void)
                             camOk = false;      /* capture died: stop trying */
                             continue;
                         }
+
+                        uint16_t *frame = (uint16_t *)Camera_GetFrame();
+
 #if RUN_FACE_DETECT
-                        if (fdOk)
-                            FaceDetect_Run((uint16_t *)Camera_GetFrame(), CAM_W, CAM_H);
+                        if (fdOk && FaceDetect_Run(frame, CAM_W, CAM_H) > 0)
+                        {
+                            FaceBox tb;
+                            if (FaceDetect_GetTopBox(&tb))
+                            {
+#if RUN_FACE_RECOG
+#if RUN_FACE_ENROLL
+                                if (frOk && !enrolled && ++enrollSeen >= ENROLL_AVG_FRAMES)
+                                {
+                                    FaceRecog_Enroll(frame, CAM_W, CAM_H, &tb, ENROLL_LABEL);
+                                    enrolled = true;
+                                    printf("[ENROLL] done — reflash with RUN_FACE_ENROLL=0 to recognize\n");
+                                }
+#else
+                                if (frOk)
+                                    FaceRecog_Run(frame, CAM_W, CAM_H, &tb);
+#endif
+#endif
+                            }
+                        }
 #endif
                         Camera_Blit(camX, camY);
                         continue;

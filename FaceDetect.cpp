@@ -61,20 +61,14 @@ static arm::app::object_detection::PostProcessParams           s_ppParams;
 static arm::app::DetectorPostProcess                          *s_post = nullptr;
 static int s_postW = 0, s_postH = 0;
 
-/* Cacheable WTRA over the arena, mirroring the FaceDetection sample so the
- * CPU<->NPU cache behaviour is identical. BoardInit sets the base regions;
- * this appends one for our arena. */
-static void setup_arena_mpu(void)
+/* Expose the arena so a single combined InitPreDefMPURegion() call (in main,
+ * covering both this arena and the face-recognition arena) can set the WTRA
+ * cache policy — the BSP configures all app MPU regions in one call, so each
+ * module must NOT call InitPreDefMPURegion on its own. */
+extern "C" void FaceDetect_GetArena(void **base, uint32_t *size)
 {
-    const ARM_MPU_Region_t cfg[] =
-    {
-        {
-            ARM_MPU_RBAR((unsigned int)s_arena, ARM_MPU_SH_NON, 0, 1, 1),
-            ARM_MPU_RLAR((unsigned int)s_arena + sizeof(s_arena) - 1,
-                         eMPU_ATTR_CACHEABLE_WTRA)
-        },
-    };
-    InitPreDefMPURegion(&cfg[0], sizeof(cfg) / sizeof(cfg[0]));
+    if (base) *base = s_arena;
+    if (size) *size = (uint32_t)sizeof(s_arena);
 }
 
 extern "C" int FaceDetect_Init(void)
@@ -87,8 +81,6 @@ extern "C" int FaceDetect_Init(void)
                (unsigned)(FACEDET_ARENA_SZ / 1024U));
         return -1;
     }
-
-    setup_arena_mpu();
 
     s_in   = s_model.GetInputTensor(0);
     s_out0 = s_model.GetOutputTensor(0);
@@ -192,4 +184,19 @@ extern "C" int FaceDetect_Run(uint16_t *frameRGB565, int w, int h)
                   FACEDET_BOX_COLOR, FACEDET_BOX_THICK);
 
     return (int)s_results.size();
+}
+
+extern "C" int FaceDetect_GetTopBox(FaceBox *out)
+{
+    if (!out || s_results.empty()) return 0;
+
+    const arm::app::object_detection::DetectionResult *best = &s_results[0];
+    for (const auto &b : s_results)
+        if (b.m_w * b.m_h > best->m_w * best->m_h) best = &b;
+
+    out->x = best->m_x0;
+    out->y = best->m_y0;
+    out->w = best->m_w;
+    out->h = best->m_h;
+    return 1;
 }
