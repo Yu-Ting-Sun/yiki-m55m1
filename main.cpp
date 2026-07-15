@@ -95,9 +95,9 @@
  *     compute its embedding and APPEND "ENROLL_LABEL:embedding" to the SD
  *     reference file, then stop. Flash once per person (change ENROLL_LABEL),
  *     then flash again with RUN_FACE_ENROLL=0 to recognise. Needs RUN_FACE_RECOG. */
-#define RUN_FACE_ENROLL    (0)
+#define RUN_FACE_ENROLL    (1)
 #define ENROLL_LABEL       "user1"
-#define ENROLL_AVG_FRAMES  (1)   /* frames to wait for a stable face before enrolling */
+#define ENROLL_SAMPLES     (8)   /* how many embeddings to append per enroll run */
 
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
@@ -477,7 +477,6 @@ int main(void)
             bool frOk = fdOk && (FaceRecog_Init() == 0);
 #endif
 #if RUN_FACE_ENROLL
-            bool enrolled  = false;
             int  enrollSeen = 0;
 #endif
             /* Single combined arena MPU setup (cacheable WTRA): the BSP
@@ -537,11 +536,11 @@ int main(void)
                             {
 #if RUN_FACE_RECOG
 #if RUN_FACE_ENROLL
-                                if (frOk && !enrolled && ++enrollSeen >= ENROLL_AVG_FRAMES)
+                                if (frOk && enrollSeen < ENROLL_SAMPLES)
                                 {
                                     FaceRecog_Enroll(frame, CAM_W, CAM_H, &tb, ENROLL_LABEL);
-                                    enrolled = true;
-                                    printf("[ENROLL] done — reflash with RUN_FACE_ENROLL=0 to recognize\n");
+                                    if (++enrollSeen >= ENROLL_SAMPLES)
+                                        printf("[ENROLL] captured %d samples — done\n", ENROLL_SAMPLES);
                                 }
 #else
                                 if (frOk)
