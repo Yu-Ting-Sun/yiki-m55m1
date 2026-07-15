@@ -56,6 +56,12 @@ int FaceDetect_Run(uint16_t *frameRGB565, int w, int h);
  */
 int FaceDetect_GetTopBox(FaceBox *out);
 
+/**
+ * @brief  Expose the detection tensor arena so the caller can set the arena
+ *         MPU policy for all app arenas in one InitPreDefMPURegion() call.
+ */
+void FaceDetect_GetArena(void **base, uint32_t *size);
+
 #ifdef __cplusplus
 }
 #endif
