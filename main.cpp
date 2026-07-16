@@ -100,16 +100,16 @@
 #define ENROLL_LABEL       "user1"
 #define ENROLL_SAMPLES     (8)   /* how many embeddings to append per enroll run */
 
-/* 1 = one-shot photo enrollment at boot (App-registration path rehearsal):
- *     if 0:\faces\enroll.raw exists (240x240 RGB565, little-endian — made by
- *     scripts/selfie_to_frame.py from a phone selfie), run the IDENTICAL
- *     detect->crop->embed pipeline on it and enroll as PHOTO_ENROLL_LABEL.
- *     The file is renamed to enroll.done afterwards so the next boot skips it
- *     (no reflash needed), and the reference is live immediately (in-memory).
- *     Needs RUN_FACE_RECOG=1 and RUN_FACE_ENROLL=0. */
+/* 1 = photo enrollment at boot (the App-registration path): every
+ *     0:\faces\enroll_<label>.raw (240x240 RGB565 LE — made by
+ *     scripts/selfie_to_frame.py from a phone selfie) is run through the
+ *     IDENTICAL detect->crop->embed pipeline and enrolled as <label>
+ *     (a trailing -N is stripped: enroll_user1-2.raw also enrolls user1,
+ *     so one user can carry several reference photos). Files are renamed
+ *     *.done afterwards, so new users register by just dropping files on
+ *     the SD card — no reflash. Needs RUN_FACE_RECOG=1, RUN_FACE_ENROLL=0. */
 #define RUN_PHOTO_ENROLL   (1)
-#define PHOTO_ENROLL_LABEL "user2"
-#define PHOTO_ENROLL_MAX   (8)   /* checks enroll.raw, enroll2.raw .. enroll8.raw */
+#define PHOTO_ENROLL_MAX   (8)   /* max photos enrolled per boot */
 
 /* Phase-5: live album filter. Single-frame cosine dips below the threshold
  * (green/red flicker), so the verdict is debounced before it drives the
@@ -572,27 +572,58 @@ int main(void)
             }
 
 #if RUN_PHOTO_ENROLL && RUN_FACE_RECOG && !RUN_FACE_ENROLL
-            /* One-shot: enroll every 0:\faces\enroll*.raw photo on the SD
-             * card, exactly as if each were a camera frame (same buffer,
-             * same detect/crop/embed). Each file is renamed *.done after. */
+            /* Photo enrollment: scan 0:\faces for enroll_<label>.raw files,
+             * run each through the identical detect/crop/embed pipeline as
+             * if it were a camera frame, enroll, then rename it *.done.
+             * (Names are collected first — renaming while f_readdir walks
+             * the directory could disturb the iteration.) */
             if (fdOk && frOk)
             {
-                for (int pi = 1; pi <= PHOTO_ENROLL_MAX; pi++)
+                static char names[PHOTO_ENROLL_MAX][40];
+                int     nFound = 0;
+                DIR     dj;
+                FILINFO fno;
+
+                if (f_opendir(&dj, "0:\\faces") == FR_OK)
                 {
-                    char rawName[32], doneName[32];
-                    if (pi == 1)
+                    while (nFound < PHOTO_ENROLL_MAX &&
+                           f_readdir(&dj, &fno) == FR_OK && fno.fname[0])
                     {
-                        strcpy(rawName,  "0:\\faces\\enroll.raw");
-                        strcpy(doneName, "0:\\faces\\enroll.done");
+                        size_t n = strlen(fno.fname);
+                        if (n >= sizeof(names[0]) ||
+                            n < 12 ||                       /* enroll_x.raw */
+                            strncmp(fno.fname, "enroll_", 7) != 0 ||
+                            strcmp(&fno.fname[n - 4], ".raw") != 0)
+                            continue;
+                        strcpy(names[nFound++], fno.fname);
                     }
-                    else
+                    f_closedir(&dj);
+                }
+
+                for (int pi = 0; pi < nFound; pi++)
+                {
+                    char   label[24], rawPath[56], donePath[56];
+                    size_t ll = strlen(names[pi]) - 7 - 4;
+                    if (ll >= sizeof(label)) continue;
+                    memcpy(label, &names[pi][7], ll);
+                    label[ll] = '\0';
+
+                    /* enroll_user1-2.raw -> user1 (extra reference photos) */
+                    char *dash = strrchr(label, '-');
+                    if (dash && dash[1])
                     {
-                        snprintf(rawName,  sizeof(rawName),  "0:\\faces\\enroll%d.raw",  pi);
-                        snprintf(doneName, sizeof(doneName), "0:\\faces\\enroll%d.done", pi);
+                        bool digits = true;
+                        for (char *p = dash + 1; *p; p++)
+                            if (*p < '0' || *p > '9') digits = false;
+                        if (digits) *dash = '\0';
                     }
 
+                    snprintf(rawPath,  sizeof(rawPath),  "0:\\faces\\%s", names[pi]);
+                    snprintf(donePath, sizeof(donePath), "0:\\faces\\%s", names[pi]);
+                    memcpy(&donePath[strlen(donePath) - 4], ".done", 6);
+
                     FIL pf;
-                    if (f_open(&pf, rawName, FA_READ) != FR_OK)
+                    if (f_open(&pf, rawPath, FA_READ) != FR_OK)
                         continue;
 
                     uint16_t *frame = (uint16_t *)Camera_GetFrame();
@@ -607,23 +638,23 @@ int main(void)
                             FaceDetect_GetTopBox(&tb))
                         {
                             if (FaceRecog_Enroll(frame, CAM_W, CAM_H, &tb,
-                                                 PHOTO_ENROLL_LABEL) == 0)
+                                                 label) == 0)
                             {
-                                f_unlink(doneName);
-                                f_rename(rawName, doneName);
+                                f_unlink(donePath);
+                                f_rename(rawPath, donePath);
                                 printf("[PHOTO-ENROLL] '%s' enrolled from %s\n",
-                                       PHOTO_ENROLL_LABEL, rawName);
+                                       label, rawPath);
                             }
                         }
                         else
                             printf("[PHOTO-ENROLL] no face detected in %s\n",
-                                   rawName);
+                                   rawPath);
 
                         Camera_Blit(camX, camY);   /* show photo + box briefly */
                     }
                     else
                         printf("[PHOTO-ENROLL] bad size in %s: read %u, want %u\n",
-                               rawName, (unsigned)br, (unsigned)(CAM_W * CAM_H * 2));
+                               rawPath, (unsigned)br, (unsigned)(CAM_W * CAM_H * 2));
                 }
             }
 #endif
