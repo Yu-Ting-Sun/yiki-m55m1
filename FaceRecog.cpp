@@ -256,6 +256,10 @@ extern "C" int FaceRecog_Enroll(uint16_t *frame, int fw, int fh,
     f_write(&fil, "\n", 1, &bw);
     f_close(&fil);
 
+    /* Also register in-memory so the new reference matches immediately,
+     * without a reboot/re-init (used by the photo-enroll one-shot). */
+    s_labels.push_back({label, emb});
+
     printf("[FACEREC] enrolled '%s' (%u-dim) -> %s\n",
            label, (unsigned)emb.size(), EMBED_REF_FILE);
     return 0;

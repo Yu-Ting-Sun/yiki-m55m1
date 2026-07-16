@@ -38,6 +38,7 @@
 #include "esp_probe.h"
 #include "day2_test.h"
 #include "day3_demo.h"
+#include "ff.h"                   /* photo-enroll one-shot reads the SD */
 
 /* 1 = Day-2 Task 0: ESP-12F firmware probe. Runs INSTEAD of everything else
  *     (slideshow and dual-model tests) and never returns — set back to 0
@@ -98,6 +99,18 @@
 #define RUN_FACE_ENROLL    (0)
 #define ENROLL_LABEL       "user1"
 #define ENROLL_SAMPLES     (8)   /* how many embeddings to append per enroll run */
+
+/* 1 = one-shot photo enrollment at boot (App-registration path rehearsal):
+ *     if 0:\faces\enroll.raw exists (240x240 RGB565, little-endian — made by
+ *     scripts/selfie_to_frame.py from a phone selfie), run the IDENTICAL
+ *     detect->crop->embed pipeline on it and enroll as PHOTO_ENROLL_LABEL.
+ *     The file is renamed to enroll.done afterwards so the next boot skips it
+ *     (no reflash needed), and the reference is live immediately (in-memory).
+ *     Needs RUN_FACE_RECOG=1 and RUN_FACE_ENROLL=0. */
+#define RUN_PHOTO_ENROLL   (1)
+#define PHOTO_ENROLL_LABEL "user2"
+#define PHOTO_ENROLL_FILE  "0:\\faces\\enroll.raw"
+#define PHOTO_ENROLL_DONE  "0:\\faces\\enroll.done"
 
 /* Phase-5: live album filter. Single-frame cosine dips below the threshold
  * (green/red flicker), so the verdict is debounced before it drives the
@@ -558,6 +571,47 @@ int main(void)
 #endif
                 InitPreDefMPURegion(&rg[0], nrg);
             }
+
+#if RUN_PHOTO_ENROLL && RUN_FACE_RECOG && !RUN_FACE_ENROLL
+            /* One-shot: enroll from a photo on the SD card, exactly as if it
+             * were a camera frame (same buffer, same detect/crop/embed). */
+            if (fdOk && frOk)
+            {
+                FIL pf;
+                if (f_open(&pf, PHOTO_ENROLL_FILE, FA_READ) == FR_OK)
+                {
+                    uint16_t *frame = (uint16_t *)Camera_GetFrame();
+                    UINT      br    = 0;
+                    FRESULT   fr2   = f_read(&pf, frame, CAM_W * CAM_H * 2, &br);
+                    f_close(&pf);
+
+                    if (fr2 == FR_OK && br == CAM_W * CAM_H * 2)
+                    {
+                        FaceBox tb;
+                        if (FaceDetect_Run(frame, CAM_W, CAM_H) > 0 &&
+                            FaceDetect_GetTopBox(&tb))
+                        {
+                            if (FaceRecog_Enroll(frame, CAM_W, CAM_H, &tb,
+                                                 PHOTO_ENROLL_LABEL) == 0)
+                            {
+                                f_unlink(PHOTO_ENROLL_DONE);
+                                f_rename(PHOTO_ENROLL_FILE, PHOTO_ENROLL_DONE);
+                                printf("[PHOTO-ENROLL] '%s' enrolled from %s\n",
+                                       PHOTO_ENROLL_LABEL, PHOTO_ENROLL_FILE);
+                            }
+                        }
+                        else
+                            printf("[PHOTO-ENROLL] no face detected in %s\n",
+                                   PHOTO_ENROLL_FILE);
+
+                        Camera_Blit(camX, camY);   /* show photo + box briefly */
+                    }
+                    else
+                        printf("[PHOTO-ENROLL] bad size: read %u, want %u\n",
+                               (unsigned)br, (unsigned)(CAM_W * CAM_H * 2));
+                }
+            }
+#endif
 #endif
 #endif
 
