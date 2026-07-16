@@ -44,6 +44,12 @@ void FaceRecog_GetArena(void **base, uint32_t *size);
 int FaceRecog_Run(uint16_t *frame, int fw, int fh, const FaceBox *box);
 
 /**
+ * @brief  Label recognised by the most recent FaceRecog_Run() that returned 1.
+ *         Only valid right after such a call (Phase-5 filter debounce input).
+ */
+const char *FaceRecog_GetLabel(void);
+
+/**
  * @brief  Compute the embedding for the face in `box` and append
  *         "label:e0,e1,...\n" to 0:\faces\embeddings.txt.
  * @return 0 on success; negative on inference / SD-write failure.

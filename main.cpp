@@ -99,6 +99,14 @@
 #define ENROLL_LABEL       "user1"
 #define ENROLL_SAMPLES     (8)   /* how many embeddings to append per enroll run */
 
+/* Phase-5: live album filter. Single-frame cosine dips below the threshold
+ * (green/red flicker), so the verdict is debounced before it drives the
+ * slideshow: FILTER_SWITCH_HITS consecutive same-label recognitions switch
+ * the filter to that user; nobody recognised for FILTER_CLEAR_MS clears it
+ * (play everything). Slideshow_SetFilter takes effect at the next photo. */
+#define FILTER_SWITCH_HITS (3)
+#define FILTER_CLEAR_MS    (5000)
+
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
  * 0 = Day-1 is signed off (see final_report.md): test code, boot log, tensor
@@ -423,6 +431,53 @@ static bool test_alternating(void)
 
 #endif /* RUN_DAY1_TESTS */
 
+#if RUN_FACE_RECOG && !RUN_FACE_ENROLL
+/*----------------------------------------------------------------------------
+ * Phase-5: debounced recognition -> slideshow album filter. Called once per
+ * captured camera frame with the recognised label, or NULL when nobody was
+ * recognised this frame (no face, unknown face, or recog unavailable).
+ *--------------------------------------------------------------------------*/
+static void SlideFilter_Update(const char *label)
+{
+    static char     curUser[32]  = "";   /* active filter, "" = play all  */
+    static char     candUser[32] = "";
+    static int      candHits     = 0;
+    static uint32_t lastSeenMs   = 0;
+
+    if (label != NULL)
+    {
+        lastSeenMs = GetSystemTick_ms();
+
+        if (strncmp(label, candUser, sizeof(candUser)) != 0)
+        {
+            strncpy(candUser, label, sizeof(candUser) - 1);
+            candUser[sizeof(candUser) - 1] = '\0';
+            candHits = 1;
+        }
+        else if (candHits < FILTER_SWITCH_HITS)
+            candHits++;
+
+        if (candHits >= FILTER_SWITCH_HITS &&
+            strncmp(candUser, curUser, sizeof(curUser)) != 0)
+        {
+            strcpy(curUser, candUser);
+            int n = Slideshow_SetFilter(curUser);
+            printf("[FILTER] -> '%s' (%d album(s))\n", curUser, n);
+        }
+    }
+    else if (curUser[0] != '\0' &&
+             (GetSystemTick_ms() - lastSeenMs) > FILTER_CLEAR_MS)
+    {
+        curUser[0]  = '\0';
+        candUser[0] = '\0';
+        candHits    = 0;
+        Slideshow_SetFilter(NULL);
+        printf("[FILTER] -> all (nobody recognised for %u ms)\n",
+               (unsigned)FILTER_CLEAR_MS);
+    }
+}
+#endif /* RUN_FACE_RECOG && !RUN_FACE_ENROLL */
+
 /*----------------------------------------------------------------------------
  * main
  *--------------------------------------------------------------------------*/
@@ -529,6 +584,9 @@ int main(void)
                         uint16_t *frame = (uint16_t *)Camera_GetFrame();
 
 #if RUN_FACE_DETECT
+#if RUN_FACE_RECOG && !RUN_FACE_ENROLL
+                        const char *seenUser = NULL;
+#endif
                         if (fdOk && FaceDetect_Run(frame, CAM_W, CAM_H) > 0)
                         {
                             FaceBox tb;
@@ -543,12 +601,15 @@ int main(void)
                                         printf("[ENROLL] captured %d samples — done\n", ENROLL_SAMPLES);
                                 }
 #else
-                                if (frOk)
-                                    FaceRecog_Run(frame, CAM_W, CAM_H, &tb);
+                                if (frOk && FaceRecog_Run(frame, CAM_W, CAM_H, &tb) == 1)
+                                    seenUser = FaceRecog_GetLabel();
 #endif
 #endif
                             }
                         }
+#if RUN_FACE_RECOG && !RUN_FACE_ENROLL
+                        SlideFilter_Update(seenUser);
+#endif
 #endif
                         Camera_Blit(camX, camY);
                         continue;

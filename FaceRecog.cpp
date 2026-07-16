@@ -49,6 +49,7 @@ static arm::app::FaceMobileNetModel s_model;
 static arm::app::Recognizer         s_recognizer;
 static std::vector<S_LABEL_INFO>    s_labels;
 
+static char          s_lastLabel[32] = "";
 static bool          s_ready   = false;
 static int           s_inCols  = 0, s_inRows = 0;
 static TfLiteTensor *s_in      = nullptr;
@@ -201,6 +202,8 @@ extern "C" int FaceRecog_Run(uint16_t *frame, int fw, int fh, const FaceBox *box
     if (ok && result.m_recognize)
     {
         printf("[FACEREC] recognized: %s (%.3f)\n", result.m_label.c_str(), result.m_predict);
+        strncpy(s_lastLabel, result.m_label.c_str(), sizeof(s_lastLabel) - 1);
+        s_lastLabel[sizeof(s_lastLabel) - 1] = '\0';
         draw_rect(frame, fw, fh, box->x, box->y, box->w, box->h,
                   RECOG_BOX_COLOR, RECOG_BOX_THICK);
         return 1;
@@ -208,6 +211,11 @@ extern "C" int FaceRecog_Run(uint16_t *frame, int fw, int fh, const FaceBox *box
 
     printf("[FACEREC] unknown (best %.3f)\n", result.m_predict);
     return 0;
+}
+
+extern "C" const char *FaceRecog_GetLabel(void)
+{
+    return s_lastLabel;
 }
 
 extern "C" int FaceRecog_Enroll(uint16_t *frame, int fw, int fh,
