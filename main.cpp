@@ -109,8 +109,7 @@
  *     Needs RUN_FACE_RECOG=1 and RUN_FACE_ENROLL=0. */
 #define RUN_PHOTO_ENROLL   (1)
 #define PHOTO_ENROLL_LABEL "user2"
-#define PHOTO_ENROLL_FILE  "0:\\faces\\enroll.raw"
-#define PHOTO_ENROLL_DONE  "0:\\faces\\enroll.done"
+#define PHOTO_ENROLL_MAX   (8)   /* checks enroll.raw, enroll2.raw .. enroll8.raw */
 
 /* Phase-5: live album filter. Single-frame cosine dips below the threshold
  * (green/red flicker), so the verdict is debounced before it drives the
@@ -573,13 +572,29 @@ int main(void)
             }
 
 #if RUN_PHOTO_ENROLL && RUN_FACE_RECOG && !RUN_FACE_ENROLL
-            /* One-shot: enroll from a photo on the SD card, exactly as if it
-             * were a camera frame (same buffer, same detect/crop/embed). */
+            /* One-shot: enroll every 0:\faces\enroll*.raw photo on the SD
+             * card, exactly as if each were a camera frame (same buffer,
+             * same detect/crop/embed). Each file is renamed *.done after. */
             if (fdOk && frOk)
             {
-                FIL pf;
-                if (f_open(&pf, PHOTO_ENROLL_FILE, FA_READ) == FR_OK)
+                for (int pi = 1; pi <= PHOTO_ENROLL_MAX; pi++)
                 {
+                    char rawName[32], doneName[32];
+                    if (pi == 1)
+                    {
+                        strcpy(rawName,  "0:\\faces\\enroll.raw");
+                        strcpy(doneName, "0:\\faces\\enroll.done");
+                    }
+                    else
+                    {
+                        snprintf(rawName,  sizeof(rawName),  "0:\\faces\\enroll%d.raw",  pi);
+                        snprintf(doneName, sizeof(doneName), "0:\\faces\\enroll%d.done", pi);
+                    }
+
+                    FIL pf;
+                    if (f_open(&pf, rawName, FA_READ) != FR_OK)
+                        continue;
+
                     uint16_t *frame = (uint16_t *)Camera_GetFrame();
                     UINT      br    = 0;
                     FRESULT   fr2   = f_read(&pf, frame, CAM_W * CAM_H * 2, &br);
@@ -594,21 +609,21 @@ int main(void)
                             if (FaceRecog_Enroll(frame, CAM_W, CAM_H, &tb,
                                                  PHOTO_ENROLL_LABEL) == 0)
                             {
-                                f_unlink(PHOTO_ENROLL_DONE);
-                                f_rename(PHOTO_ENROLL_FILE, PHOTO_ENROLL_DONE);
+                                f_unlink(doneName);
+                                f_rename(rawName, doneName);
                                 printf("[PHOTO-ENROLL] '%s' enrolled from %s\n",
-                                       PHOTO_ENROLL_LABEL, PHOTO_ENROLL_FILE);
+                                       PHOTO_ENROLL_LABEL, rawName);
                             }
                         }
                         else
                             printf("[PHOTO-ENROLL] no face detected in %s\n",
-                                   PHOTO_ENROLL_FILE);
+                                   rawName);
 
                         Camera_Blit(camX, camY);   /* show photo + box briefly */
                     }
                     else
-                        printf("[PHOTO-ENROLL] bad size: read %u, want %u\n",
-                               (unsigned)br, (unsigned)(CAM_W * CAM_H * 2));
+                        printf("[PHOTO-ENROLL] bad size in %s: read %u, want %u\n",
+                               rawName, (unsigned)br, (unsigned)(CAM_W * CAM_H * 2));
                 }
             }
 #endif
