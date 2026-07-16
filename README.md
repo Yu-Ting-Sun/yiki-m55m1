@@ -5,6 +5,7 @@
 - **Day 1** — 雙 TFLite 模型（人臉 + 手勢 YOLOv8n）共存 HyperRAM、NPU 交替推論（Face 42 ms / Gesture 31 ms，500 次切換零劣化）→ [final_report.md](final_report.md)
 - **Day 2** — 板載 ESP-12F（AT 韌體、UART8 115200）連 Wi-Fi 打 FastAPI 後端（100 次請求零掉包，平均 50 ms）→ [day2_report.md](day2_report.md)
 - **Day 3** — LLM（gemini-3-flash via LiteLLM proxy）生成家人旅遊故事，後端渲染成中文點陣圖，LCD 左照片輪播、右故事欄同屏顯示
+- **Week 2（本 branch `feature/album-filter`）** — 相機（CCAP/HM1055）+ NPU 人臉辨識相簿過濾：相框認得站在面前的人，輪播自動切成他參加過的相簿 → 見下方「[人臉辨識相簿過濾](#人臉辨識相簿過濾week-2featurealbum-filter)」
 
 ## Demo 畫面（RUN_DAY3_DEMO=1，預設）
 
@@ -20,6 +21,9 @@
 
 開機流程：畫版面 → Wi-Fi → `POST /generate`（LLM 10–30 秒，右欄顯示狀態）→
 `GET /textimg` → 故事上屏 → 左區開始輪播 SD 卡照片。
+
+照片區右下角另有 240×240 即時相機預覽：偵測到臉畫紅框，辨識成功轉綠框並
+切換輪播內容（Week 2 功能，見下方專章）。
 
 ## Clone 位置（必讀）
 
@@ -75,8 +79,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ### 3. SD 卡
 
-- `0:\pictures\` — 手機 JPG 照片（橫拍會滿版顯示；PNG/HEIC 不支援，
-  可用 `scripts/prepare_pictures.py` 轉檔）
+- `0:\pictures\` — 根目錄放散照（JPG），**子資料夾 = 相簿**（一趟旅程一夾），
+  每個相簿放 `label.json`：`{"users": ["user1", "user2"]}` 標記參加者
+  （PNG/HEIC 不支援，可用 `scripts/prepare_pictures.py` 轉檔）
+- `0:\face_mobilenet.tflite` — 人臉 embedding 模型（Vela 版，3.17 MB，
+  從 BSP `SampleCode\NuEdgeWise\FaceRecognition\Model\` 複製）— 人臉辨識必需
+- `0:\faces\` — `embeddings.txt`（已註冊使用者的參考向量）與
+  `enroll_<label>.raw`（待註冊自拍，見下方註冊流程）
 - `face_model.tflite` + `gesture_model.tflite` 放根目錄 — 只有跑 Day-1
   推論測試（`RUN_DAY1_TESTS=1`）才需要，demo 模式不用
 
@@ -105,7 +114,81 @@ Download（F8），或 CLI：
 | `RUN_DAY2_TESTS` | 0 | Wi-Fi + HTTP 鏈路驗證（4 項測試） |
 | `RUN_DAY3_DEMO` | **1** | 相框版面 + LLM 故事 demo |
 | `RUN_SLIDESHOW` | 1 | 純照片輪播（僅當 DAY3=0） |
+| `RUN_CAMERA_PREVIEW` | **1** | 相機即時預覽（照片區右下角） |
+| `RUN_FACE_DETECT` | **1** | 即時人臉偵測（紅框，需 PREVIEW） |
+| `RUN_FACE_RECOG` | **1** | 人臉辨識 + 相簿過濾（綠框，需 DETECT） |
+| `RUN_FACE_ENROLL` | 0 | 現場註冊模式：連拍 8 張寫入 SD（需 RECOG） |
+| `RUN_PHOTO_ENROLL` | **1** | 開機掃 SD `faces\enroll_*.raw` 自動註冊（需 RECOG） |
 | `RUN_DAY1_TESTS` | 0 | 雙模型 NPU 推論測試（需 SD 模型檔） |
+
+## 人臉辨識相簿過濾（Week 2，feature/album-filter）
+
+相框認得站在面前的人：辨識成功後輪播自動切成「他參加過的相簿聯集」
+（相簿裡沒有他的照片也照播）；沒有人臉或認不得的人（5 秒）→ 恢復播全部。
+2026-07-16 於板上驗證通過，含「App 自拍註冊 → 真人辨識」路線。
+
+### 資料流（每張照片的 3 秒 hold 期間逐格執行）
+
+```
+CCAP/HM1055 240×240 RGB565（一次性觸發擷取）
+ → yolo-fastest_192_face 偵測（模型編譯進 APROM，512 KB SRAM arena）→ 紅框
+ → 取最大臉框 crop → resize → RGB888 → int8（uint8−128）
+ → FaceMobileNet embedding（SD → HyperRAM FACE slot，512 KB arena，256 維）
+ → cosine 比對 0:\faces\embeddings.txt（門檻 0.50，最佳者勝）→ 綠框
+ → debounce（同一人 3 次 → 切 playlist；5 秒沒認到任何人 → 播全部）
+ → Slideshow_SetFilter()（label.json 聯集，於照片邊界生效）
+```
+
+主要新增檔案：`Camera.c`、`FaceDetect.cpp`、`FaceRecog.cpp`、
+`Recognizer.cpp`、`Model/FaceMobileNetModel.cpp`、`Model/NN_Model_INT8.tflite.cpp`
+（偵測模型 C array）、`scripts/selfie_to_frame.py`；`Slideshow.c` 重構為
+相簿/playlist/filter 架構。
+
+### 使用者註冊（三條路）
+
+| 方式 | 流程 | 定位 |
+|---|---|---|
+| **照片註冊**（預設開） | `python scripts/selfie_to_frame.py --label user1 自拍.jpg`（可一次多張）→ 產出的 `enroll_user1.raw` 丟進 SD `faces\` → 重開機自動註冊，完成後改名 `.done` | App 註冊路線的裝置端；**不用重燒韌體** |
+| 現場註冊（`RUN_FACE_ENROLL=1` 重燒） | 站在鏡頭前，開機自動連拍 8 張取樣寫入 SD | 參考品質最好（live cosine 0.8+） |
+| App 註冊（未實作，見交接注意） | App 上傳自拍＋名字 → 後端轉 raw 下發 SD → 重開機 | 產品最終形態 |
+
+### 調參
+
+| 參數 | 位置 | 預設 | 說明 |
+|---|---|---|---|
+| `RECOG_THRESHOLD` | FaceRecog.cpp | 0.50 | 照片參考的 cosine 峰值僅 ~0.53（live 參考 0.8+），設 0.6 會全部拒絕 |
+| `FILTER_SWITCH_HITS` | main.cpp | 3 | 連續同名辨識幾次才切換（穿插的失敗 frame 不重置計數） |
+| `FILTER_CLEAR_MS` | main.cpp | 5000 | 多久沒認到任何人就恢復播全部 |
+
+### 交接注意 — App / 後端組必讀
+
+1. **embedding 空間不可混用**。SD 上的 `face_mobilenet.tflite` 是 **Vela
+   編譯版**（含 ethos-u custom op），只有板上 NPU 跑得動，一般電腦跑不動，
+   repo 裡也沒有原始版。所以**推論一律留在裝置**：後端只負責把自拍轉成
+   `enroll_<label>.raw`（照抄 `selfie_to_frame.py`：EXIF 轉正 → 中心方形
+   裁切 → 240×240 → RGB565 小端序）下發 SD，板子開機自己算。若未來想在
+   後端直接算 embedding，必須取得 Vela 編譯**前**的同一顆 int8 模型，並
+   複製一模一樣的前處理（同一個偵測器與框法、同 crop、RGB888、
+   int8 = uint8−128）——任何一步不同，向量空間就對不上，比對全滅。
+2. **照片 vs 真人的量化差距（2026-07-16 實測）**：同一個人，自拍照參考對
+   真人查詢的 cosine 峰值只有 **~0.53**；真人參考對真人是 **0.8+**。因此
+   照片註冊的使用者綠框會紅綠交錯（門檻 0.50 餘裕僅 0.03），但 debounce
+   保證 playlist 切換穩定。改善方向：每人多張參考照（檔名 `-2`、`-3`
+   尾碼）、用相框現場光線拍、或 **progressive enrollment**（首次辨識成功
+   後用現場 frame 自動補一條 live 參考，直接升級到 0.8 等級——建議 App
+   版實作這個）。
+3. **App 功能對應**：註冊 = 上傳自拍＋名字（後端轉檔下發）；相簿上傳 =
+   勾選參加者 → 後端把 `{"users": [...]}` 寫進該相簿資料夾的
+   `label.json`。`label.json` 與 `embeddings.txt` 都是純文字、後端可直接
+   讀寫——這是刻意的設計，韌體只讀不管理。
+4. **embeddings.txt 格式（易踩雷）**：一行一人
+   `label:v0:v1:...:v255:`，**冒號分隔且行尾也要冒號**——parser 只在遇到
+   下一個冒號時收字，用逗號分隔會整行解析成空向量、永遠比對失敗。同名
+   多行 = 同一人多張參考，比對取最佳分。
+5. **已知問題**：(a) UART 在 ESP Wi-Fi 段之後會亂碼（baud 漂移，未修）——
+   驗證辨識請看螢幕框色與實際播放內容，別信後段 log。(b) 辨識切換
+   playlist 時照片區會短暫黑屏（清前組殘影＋JPEG 解碼時間，設計如此，
+   也可視為切換成功的視覺回饋）。(c) 一次只處理畫面中**最大**的一張臉。
 
 ## 後端 API（backend/main.py）
 
@@ -130,6 +213,10 @@ Download（F8），或 CLI：
             | 1 MB rear spare (照片FB) |
 0x82800000  +-------------------------+
 ```
+
+> Week 2 借用：DAY3 模式不從 SD 載 FACE/GESTURE 模型，FACE slot 改放
+> 人臉 embedding 模型（3.17 MB，尾端溢入 GESTURE slot 前段——DAY3 不用
+> 手勢，安全）。兩顆推論 arena（偵測/embedding 各 512 KB）則在 SRAM01。
 
 ## 專案沿革
 
