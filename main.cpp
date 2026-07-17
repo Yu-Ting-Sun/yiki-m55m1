@@ -32,9 +32,13 @@
 #include "Display.h"
 #include "Slideshow.h"
 #include "StoryUI.h"
+#include "Camera.h"
+#include "FaceDetect.hpp"
+#include "FaceRecog.hpp"
 #include "esp_probe.h"
 #include "day2_test.h"
 #include "day3_demo.h"
+#include "ff.h"                   /* photo-enroll one-shot reads the SD */
 
 /* 1 = Day-2 Task 0: ESP-12F firmware probe. Runs INSTEAD of everything else
  *     (slideshow and dual-model tests) and never returns — set back to 0
@@ -64,6 +68,56 @@
 
 #define SLIDESHOW_DIR      "0:\\pictures"
 #define SLIDESHOW_HOLD_MS  (3000)
+
+/* Simulated face-recognition verdict, until the camera path exists: set to a
+ * user named in the album label.json files (e.g. "user1") to play only that
+ * user's albums; NULL = no filter (play everything, same as before). */
+#define SLIDESHOW_SIM_USER ((const char *)NULL)
+
+/* 1 = Phase-2: HM1055 camera preview in the bottom-right corner of the photo
+ *     region, refreshed continuously between photos. Camera init failure is
+ *     non-fatal (plain slideshow keeps running). Only affects RUN_DAY3_DEMO. */
+#define RUN_CAMERA_PREVIEW (1)
+
+/* 1 = Phase-3: run face detection (compiled-in yolo-fastest_192_face +
+ *     DetectorPostProcessing) on each captured frame and draw the face boxes
+ *     onto the preview. Needs RUN_CAMERA_PREVIEW. Init failure is non-fatal
+ *     (preview keeps running without boxes). */
+#define RUN_FACE_DETECT    (1)
+
+/* 1 = Phase-4: face recognition. On each detected face, crop -> FaceMobileNet
+ *     embedding -> cosine-match against SD references (0:\faces\embeddings.txt).
+ *     Recognised faces are re-drawn with a green box; result logged on UART.
+ *     Needs RUN_FACE_DETECT and 0:\face_mobilenet.tflite on the SD card. Init
+ *     failure is non-fatal (detection keeps running). */
+#define RUN_FACE_RECOG     (1)
+
+/* 1 = ENROLL mode: instead of recognising, capture the largest detected face,
+ *     compute its embedding and APPEND "ENROLL_LABEL:embedding" to the SD
+ *     reference file, then stop. Flash once per person (change ENROLL_LABEL),
+ *     then flash again with RUN_FACE_ENROLL=0 to recognise. Needs RUN_FACE_RECOG. */
+#define RUN_FACE_ENROLL    (0)
+#define ENROLL_LABEL       "user1"
+#define ENROLL_SAMPLES     (8)   /* how many embeddings to append per enroll run */
+
+/* 1 = photo enrollment at boot (the App-registration path): every
+ *     0:\faces\enroll_<label>.raw (240x240 RGB565 LE — made by
+ *     scripts/selfie_to_frame.py from a phone selfie) is run through the
+ *     IDENTICAL detect->crop->embed pipeline and enrolled as <label>
+ *     (a trailing -N is stripped: enroll_user1-2.raw also enrolls user1,
+ *     so one user can carry several reference photos). Files are renamed
+ *     *.done afterwards, so new users register by just dropping files on
+ *     the SD card — no reflash. Needs RUN_FACE_RECOG=1, RUN_FACE_ENROLL=0. */
+#define RUN_PHOTO_ENROLL   (1)
+#define PHOTO_ENROLL_MAX   (8)   /* max photos enrolled per boot */
+
+/* Phase-5: live album filter. Single-frame cosine dips below the threshold
+ * (green/red flicker), so the verdict is debounced before it drives the
+ * slideshow: FILTER_SWITCH_HITS consecutive same-label recognitions switch
+ * the filter to that user; nobody recognised for FILTER_CLEAR_MS clears it
+ * (play everything). Slideshow_SetFilter takes effect at the next photo. */
+#define FILTER_SWITCH_HITS (3)
+#define FILTER_CLEAR_MS    (5000)
 
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
@@ -389,6 +443,53 @@ static bool test_alternating(void)
 
 #endif /* RUN_DAY1_TESTS */
 
+#if RUN_FACE_RECOG && !RUN_FACE_ENROLL
+/*----------------------------------------------------------------------------
+ * Phase-5: debounced recognition -> slideshow album filter. Called once per
+ * captured camera frame with the recognised label, or NULL when nobody was
+ * recognised this frame (no face, unknown face, or recog unavailable).
+ *--------------------------------------------------------------------------*/
+static void SlideFilter_Update(const char *label)
+{
+    static char     curUser[32]  = "";   /* active filter, "" = play all  */
+    static char     candUser[32] = "";
+    static int      candHits     = 0;
+    static uint32_t lastSeenMs   = 0;
+
+    if (label != NULL)
+    {
+        lastSeenMs = GetSystemTick_ms();
+
+        if (strncmp(label, candUser, sizeof(candUser)) != 0)
+        {
+            strncpy(candUser, label, sizeof(candUser) - 1);
+            candUser[sizeof(candUser) - 1] = '\0';
+            candHits = 1;
+        }
+        else if (candHits < FILTER_SWITCH_HITS)
+            candHits++;
+
+        if (candHits >= FILTER_SWITCH_HITS &&
+            strncmp(candUser, curUser, sizeof(curUser)) != 0)
+        {
+            strcpy(curUser, candUser);
+            int n = Slideshow_SetFilter(curUser);
+            printf("[FILTER] -> '%s' (%d album(s))\n", curUser, n);
+        }
+    }
+    else if (curUser[0] != '\0' &&
+             (GetSystemTick_ms() - lastSeenMs) > FILTER_CLEAR_MS)
+    {
+        curUser[0]  = '\0';
+        candUser[0] = '\0';
+        candHits    = 0;
+        Slideshow_SetFilter(NULL);
+        printf("[FILTER] -> all (nobody recognised for %u ms)\n",
+               (unsigned)FILTER_CLEAR_MS);
+    }
+}
+#endif /* RUN_FACE_RECOG && !RUN_FACE_ENROLL */
+
 /*----------------------------------------------------------------------------
  * main
  *--------------------------------------------------------------------------*/
@@ -421,7 +522,204 @@ int main(void)
             printf_err("Day-3 story failed (rc=%d) - running photos only\n", d3);
 
         Slideshow_ReserveRight(STORYUI_RESERVED_PX);
-        int slrc = Slideshow_Run(SLIDESHOW_DIR, SLIDESHOW_HOLD_MS);
+        Slideshow_SetFilter(SLIDESHOW_SIM_USER);
+
+        int slrc;
+
+        if (Slideshow_LibScan(SLIDESHOW_DIR) < 0)
+            slrc = -1;
+        else
+        {
+#if RUN_CAMERA_PREVIEW
+            /* Preview sits in the bottom-right corner of the photo region.
+             * No camera (init fail) degrades to the plain slideshow. */
+            bool     camOk = (Camera_Init() == 0);
+            uint32_t camX  = Disaplay_GetLCDWidth() - STORYUI_RESERVED_PX - CAM_W;
+            uint32_t camY  = Disaplay_GetLCDHeight() - CAM_H;
+#if RUN_FACE_DETECT
+            /* Face detection draws boxes onto the frame before it is blitted.
+             * Init failure degrades to plain preview (no boxes). */
+            bool fdOk = camOk && (FaceDetect_Init() == 0);
+#if RUN_FACE_RECOG
+            bool frOk = fdOk && (FaceRecog_Init() == 0);
+#endif
+#if RUN_FACE_ENROLL
+            int  enrollSeen = 0;
+#endif
+            /* Single combined arena MPU setup (cacheable WTRA): the BSP
+             * configures all app MPU regions in ONE InitPreDefMPURegion call,
+             * so both arenas are set together here rather than per module. */
+            if (fdOk)
+            {
+                ARM_MPU_Region_t rg[2];
+                uint32_t nrg = 0;
+                void    *aBase; uint32_t aSize;
+
+                FaceDetect_GetArena(&aBase, &aSize);
+                rg[nrg].RBAR = ARM_MPU_RBAR((unsigned int)aBase, ARM_MPU_SH_NON, 0, 1, 1);
+                rg[nrg].RLAR = ARM_MPU_RLAR((unsigned int)aBase + aSize - 1, eMPU_ATTR_CACHEABLE_WTRA);
+                nrg++;
+#if RUN_FACE_RECOG
+                if (frOk)
+                {
+                    FaceRecog_GetArena(&aBase, &aSize);
+                    rg[nrg].RBAR = ARM_MPU_RBAR((unsigned int)aBase, ARM_MPU_SH_NON, 0, 1, 1);
+                    rg[nrg].RLAR = ARM_MPU_RLAR((unsigned int)aBase + aSize - 1, eMPU_ATTR_CACHEABLE_WTRA);
+                    nrg++;
+                }
+#endif
+                InitPreDefMPURegion(&rg[0], nrg);
+            }
+
+#if RUN_PHOTO_ENROLL && RUN_FACE_RECOG && !RUN_FACE_ENROLL
+            /* Photo enrollment: scan 0:\faces for enroll_<label>.raw files,
+             * run each through the identical detect/crop/embed pipeline as
+             * if it were a camera frame, enroll, then rename it *.done.
+             * (Names are collected first — renaming while f_readdir walks
+             * the directory could disturb the iteration.) */
+            if (fdOk && frOk)
+            {
+                static char names[PHOTO_ENROLL_MAX][40];
+                int     nFound = 0;
+                DIR     dj;
+                FILINFO fno;
+
+                if (f_opendir(&dj, "0:\\faces") == FR_OK)
+                {
+                    while (nFound < PHOTO_ENROLL_MAX &&
+                           f_readdir(&dj, &fno) == FR_OK && fno.fname[0])
+                    {
+                        size_t n = strlen(fno.fname);
+                        if (n >= sizeof(names[0]) ||
+                            n < 12 ||                       /* enroll_x.raw */
+                            strncmp(fno.fname, "enroll_", 7) != 0 ||
+                            strcmp(&fno.fname[n - 4], ".raw") != 0)
+                            continue;
+                        strcpy(names[nFound++], fno.fname);
+                    }
+                    f_closedir(&dj);
+                }
+
+                for (int pi = 0; pi < nFound; pi++)
+                {
+                    char   label[24], rawPath[56], donePath[56];
+                    size_t ll = strlen(names[pi]) - 7 - 4;
+                    if (ll >= sizeof(label)) continue;
+                    memcpy(label, &names[pi][7], ll);
+                    label[ll] = '\0';
+
+                    /* enroll_user1-2.raw -> user1 (extra reference photos) */
+                    char *dash = strrchr(label, '-');
+                    if (dash && dash[1])
+                    {
+                        bool digits = true;
+                        for (char *p = dash + 1; *p; p++)
+                            if (*p < '0' || *p > '9') digits = false;
+                        if (digits) *dash = '\0';
+                    }
+
+                    snprintf(rawPath,  sizeof(rawPath),  "0:\\faces\\%s", names[pi]);
+                    snprintf(donePath, sizeof(donePath), "0:\\faces\\%s", names[pi]);
+                    memcpy(&donePath[strlen(donePath) - 4], ".done", 6);
+
+                    FIL pf;
+                    if (f_open(&pf, rawPath, FA_READ) != FR_OK)
+                        continue;
+
+                    uint16_t *frame = (uint16_t *)Camera_GetFrame();
+                    UINT      br    = 0;
+                    FRESULT   fr2   = f_read(&pf, frame, CAM_W * CAM_H * 2, &br);
+                    f_close(&pf);
+
+                    if (fr2 == FR_OK && br == CAM_W * CAM_H * 2)
+                    {
+                        FaceBox tb;
+                        if (FaceDetect_Run(frame, CAM_W, CAM_H) > 0 &&
+                            FaceDetect_GetTopBox(&tb))
+                        {
+                            if (FaceRecog_Enroll(frame, CAM_W, CAM_H, &tb,
+                                                 label) == 0)
+                            {
+                                f_unlink(donePath);
+                                f_rename(rawPath, donePath);
+                                printf("[PHOTO-ENROLL] '%s' enrolled from %s\n",
+                                       label, rawPath);
+                            }
+                        }
+                        else
+                            printf("[PHOTO-ENROLL] no face detected in %s\n",
+                                   rawPath);
+
+                        Camera_Blit(camX, camY);   /* show photo + box briefly */
+                    }
+                    else
+                        printf("[PHOTO-ENROLL] bad size in %s: read %u, want %u\n",
+                               rawPath, (unsigned)br, (unsigned)(CAM_W * CAM_H * 2));
+                }
+            }
+#endif
+#endif
+#endif
+
+            for (;;)
+            {
+                slrc = Slideshow_ShowNext();
+                if (slrc != 0) break;
+
+                /* Hold window: this idle time is where the camera (and later
+                 * the face-recognition inference) runs. */
+                uint32_t t0 = GetSystemTick_ms();
+
+                while ((GetSystemTick_ms() - t0) < SLIDESHOW_HOLD_MS)
+                {
+#if RUN_CAMERA_PREVIEW
+                    if (camOk)
+                    {
+                        if (Camera_Capture() != 0)
+                        {
+                            camOk = false;      /* capture died: stop trying */
+                            continue;
+                        }
+
+                        uint16_t *frame = (uint16_t *)Camera_GetFrame();
+
+#if RUN_FACE_DETECT
+#if RUN_FACE_RECOG && !RUN_FACE_ENROLL
+                        const char *seenUser = NULL;
+#endif
+                        if (fdOk && FaceDetect_Run(frame, CAM_W, CAM_H) > 0)
+                        {
+                            FaceBox tb;
+                            if (FaceDetect_GetTopBox(&tb))
+                            {
+#if RUN_FACE_RECOG
+#if RUN_FACE_ENROLL
+                                if (frOk && enrollSeen < ENROLL_SAMPLES)
+                                {
+                                    FaceRecog_Enroll(frame, CAM_W, CAM_H, &tb, ENROLL_LABEL);
+                                    if (++enrollSeen >= ENROLL_SAMPLES)
+                                        printf("[ENROLL] captured %d samples — done\n", ENROLL_SAMPLES);
+                                }
+#else
+                                if (frOk && FaceRecog_Run(frame, CAM_W, CAM_H, &tb) == 1)
+                                    seenUser = FaceRecog_GetLabel();
+#endif
+#endif
+                            }
+                        }
+#if RUN_FACE_RECOG && !RUN_FACE_ENROLL
+                        SlideFilter_Update(seenUser);
+#endif
+#endif
+                        Camera_Blit(camX, camY);
+                        continue;
+                    }
+#endif
+                    Display_Delay(50);
+                }
+            }
+        }
+
         printf_err("Slideshow could not run (rc=%d) - keeping story screen\n", slrc);
         for (;;) __WFI();     /* keep whatever is on screen; demo is over */
     }
@@ -433,6 +731,7 @@ int main(void)
      * while it has photos to show; on failure fall through to the tests. */
     if (Display_Init() == 0)
     {
+        Slideshow_SetFilter(SLIDESHOW_SIM_USER);
         int slrc = Slideshow_Run(SLIDESHOW_DIR, SLIDESHOW_HOLD_MS);
         printf_err("Slideshow could not run (rc=%d) - continuing with tests\n", slrc);
     }

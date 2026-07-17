@@ -139,8 +139,7 @@
           <bUseTDR>1</bUseTDR>
           <Flash2>BIN\UL2V8M.DLL</Flash2>
           <Flash3>"" ()</Flash3>
-          <Flash4>
-          </Flash4><pFcarmOut>
+          <Flash4></Flash4><pFcarmOut>
           </pFcarmOut><pFcarmGrp>
           </pFcarmGrp><pFcArmRoot>
           </pFcArmRoot><FcArmLst>0</FcArmLst>
@@ -310,8 +309,7 @@
                 <Size>0x150000</Size>
               </OCR_RVCT10>
             </OnChipMemories>
-            <RvctStartVector>
-            </RvctStartVector></ArmAdsMisc>
+            <RvctStartVector></RvctStartVector></ArmAdsMisc>
           <Cads>
             <interw>1</interw>
             <Optim>3</Optim>
@@ -337,7 +335,8 @@
             <v6WtE>0</v6WtE>
             <v6Rtti>0</v6Rtti>
             <VariousControls>
-              <MiscControls></MiscControls>              <Define>NVT_VECTOR_ON_FLASH, TF_LITE_STATIC_MEMORY, ARM_MATH_DSP, ARM_NPU</Define>
+              <MiscControls>
+</MiscControls>              <Define>NVT_VECTOR_ON_FLASH, TF_LITE_STATIC_MEMORY, ARM_MATH_DSP, ARM_NPU</Define>
               <Undefine>
               </Undefine><IncludePath>..\..\..\..\Library\CMSIS\Core\Include;..\..\..\..\Library\Device\Nuvoton\M55M1\Include;..\..\..\..\Library\CMSIS\DSP\Include;..\..\..\..\Library\StdDriver\inc;..\..\..\..\Library\StdDriver\inc\npu;..\..\..\..\ThirdParty\openmv\omv\imlib;..\..\..\..\ThirdParty\openmv\omv\alloc;..\..\..\..\ThirdParty\openmv\omv\common;..\..\..\..\ThirdParty\openmv\omv\Lib;..\..\..\..\ThirdParty\tflite_micro;..\..\..\..\ThirdParty\tflite_micro\_deps\tensorflow-flatbuffers-src\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\application\api\common\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\log\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\math\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\application\main\include;..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\profiler\include;..\Device\include;..\Model\include;..\NPU\include;..\Pattern\include;..\ProfilerCounter\include;..\ByteTrack\include;..;..\..\..\..\ThirdParty\tflite_micro\_deps\tensorflow-gemlowp-src;..\..\..\..\ThirdParty\FatFs\source;..\..\..\..\ThirdParty\eigen</IncludePath>
             </VariousControls>
@@ -354,7 +353,8 @@
             <useXO>0</useXO>
             <ClangAsOpt>2</ClangAsOpt>
             <VariousControls>
-              <MiscControls></MiscControls>              <Define>
+              <MiscControls>
+</MiscControls>              <Define>
               </Define><Undefine>
               </Undefine><IncludePath>
               </IncludePath></VariousControls>
@@ -552,6 +552,31 @@
               <FileType>1</FileType>
               <FilePath>..\tjpgd.c</FilePath>
             </File>
+            <File>
+              <FileName>FaceDetect.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\FaceDetect.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>DetectorPostProcessing.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\DetectorPostProcessing.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>FaceRecog.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\FaceRecog.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>Recognizer.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\Recognizer.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>LabelFileReader.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\LabelFileReader.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -592,6 +617,26 @@
               <FileType>8</FileType>
               <FilePath>..\Model\GestureModel.cpp</FilePath>
             </File>
+            <File>
+              <FileName>NNModel.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\Model\NNModel.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>NN_Model_INT8.tflite.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\Model\NN_Model_INT8.tflite.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>FaceMobileNetModel.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\Model\FaceMobileNetModel.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>Labels.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\Model\Labels.cpp</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -616,6 +661,11 @@
               <FileName>Profiler.cc</FileName>
               <FileType>8</FileType>
               <FilePath>..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\profiler\Profiler.cc</FilePath>
+            </File>
+            <File>
+              <FileName>ImageUtils.cc</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\..\..\..\ThirdParty\ml-embedded-evaluation-kit\source\application\api\common\source\ImageUtils.cc</FilePath>
             </File>
           </Files>
         </Group>
@@ -696,6 +746,26 @@
               <FileName>LCD_ILI9341.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Device\Display\LCD\LCD_ILI9341.c</FilePath>
+            </File>
+            <File>
+              <FileName>ImageSensor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Device\ImageSensor\ImageSensor.c</FilePath>
+            </File>
+            <File>
+              <FileName>Sensor_HM1055.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Device\ImageSensor\Sensor\Sensor_HM1055.c</FilePath>
+            </File>
+            <File>
+              <FileName>SWI2C.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Device\ImageSensor\Sensor\SWI2C.c</FilePath>
+            </File>
+            <File>
+              <FileName>Camera.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Camera.c</FilePath>
             </File>
           </Files>
         </Group>

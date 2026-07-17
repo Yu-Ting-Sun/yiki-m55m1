@@ -26,13 +26,40 @@ extern "C" {
 void Slideshow_ReserveRight(uint32_t px);
 
 /**
- * @brief  Loop forever showing every *.bmp in @p dirPath on the LCD.
+ * @brief  Scan the photo library. Albums are the subfolders of @p rootPath;
+ *         each may carry a label.json ({"users": ["user1", ...]}) naming the
+ *         people that album relates to. Loose files directly in the root are
+ *         an unlabeled pseudo-album that only plays when no filter is set.
+ * @param  rootPath  FATFS directory, e.g. "0:\\pictures".
+ * @return Number of albums found (>= 0), or -1 if the root is unopenable.
+ */
+int Slideshow_LibScan(const char *rootPath);
+
+/**
+ * @brief  Restrict playback to the albums whose label.json lists @p user
+ *         (case-insensitive). NULL or "" clears the filter (play everything).
+ *         A user matching no album degrades to playing everything. Takes
+ *         effect at the next Slideshow_ShowNext() call; may be called at any
+ *         time (e.g. from the face-recognition loop).
+ * @return Number of albums in the resulting play set.
+ */
+int Slideshow_SetFilter(const char *user);
+
+/**
+ * @brief  Decode + display the next photo of the play set (albums cycle in
+ *         scan order, looping forever). Blocks only for the decode itself —
+ *         pacing (hold time) is the caller's job, so camera capture and
+ *         inference can run between photos.
+ * @return 0 photo shown; -1 library not scanned; -2 a full pass found no
+ *         displayable photo; -3 directory read error.
+ */
+int Slideshow_ShowNext(void);
+
+/**
+ * @brief  Convenience wrapper: Slideshow_LibScan + ShowNext/Delay forever.
  * @param  dirPath  FATFS directory, e.g. "0:\\pictures".
  * @param  holdMs   How long each photo stays on screen (ms).
- * @return Only returns on failure:
- *         -1 directory missing/unopenable;
- *         -2 a full pass found no displayable BMP;
- *         -3 directory read error.
+ * @return Only returns on failure (codes as above).
  */
 int Slideshow_Run(const char *dirPath, uint32_t holdMs);
 
