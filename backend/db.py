@@ -12,7 +12,7 @@ import math
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -35,6 +35,9 @@ class Trip(Base):
     end_time: Mapped[datetime | None] = mapped_column(DateTime, default=None)
     distance_m: Mapped[float] = mapped_column(Float, default=0.0)
     story_text: Mapped[str] = mapped_column(Text, default="")
+    # 參加者（JSON list of face labels，例 '["dad","mom"]'）——
+    # 相框 label.json 的資料來源，需與板端人臉註冊的 label 一致。
+    members: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
 
     points: Mapped[list["GpsPoint"]] = relationship(
@@ -97,6 +100,14 @@ class Frame(Base):
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # 輕量 migration：create_all 不會幫既有資料表加欄位，
+        # 舊 yiki.db 的 trips 沒有 members 就補上。
+        cols = (await conn.execute(text("PRAGMA table_info(trips)"))).fetchall()
+        if not any(c[1] == "members" for c in cols):
+            await conn.execute(
+                text("ALTER TABLE trips ADD COLUMN members TEXT NOT NULL DEFAULT '[]'")
+            )
+            print("[db] migrated: trips.members added")
 
 
 def utcnow() -> datetime:

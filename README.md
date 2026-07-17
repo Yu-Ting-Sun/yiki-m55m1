@@ -82,6 +82,12 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 - `0:\pictures\` — 根目錄放散照（JPG），**子資料夾 = 相簿**（一趟旅程一夾），
   每個相簿放 `label.json`：`{"users": ["user1", "user2"]}` 標記參加者
   （PNG/HEIC 不支援，可用 `scripts/prepare_pictures.py` 轉檔）
+  - 後端的整批同步已對齊這個結構：`GET /frames/{id}/sync` 回傳每趟旅程的
+    `folder`（放在 `pictures\` 下）、`label_json`/`story_txt`/`story_tim`/
+    `story_wav`/`photos[]` 下載 URL 與 `version`（寫進 `VERSION.TXT`，
+    下次比對相同即整趟跳過）。照片經 `/photos/{id}/board` 轉成 480px
+    baseline JPEG（tjpgd 可解），STORY.*/VERSION.TXT 會被相簿掃描自動略過。
+    參加者在 App 旅程詳情頁編輯（PUT /trips/{id}/members）。
 - `0:\face_mobilenet.tflite` — 人臉 embedding 模型（Vela 版，3.17 MB，
   從 BSP `SampleCode\NuEdgeWise\FaceRecognition\Model\` 複製）— 人臉辨識必需
 - `0:\faces\` — `embeddings.txt`（已註冊使用者的參考向量）與

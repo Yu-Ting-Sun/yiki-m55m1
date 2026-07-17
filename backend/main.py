@@ -505,6 +505,7 @@ async def trip_detail(trip_id: int):
             trip.photos[0].id if trip.photos else None,
         )
         detail["story_text"] = trip.story_text
+        detail["members"] = trip_members(trip)
         detail["points"] = [
             {"lat": p.lat, "lng": p.lng, "timestamp": db.iso_z(p.timestamp)}
             for p in trip.points
@@ -934,6 +935,51 @@ async def update_trip_story(trip_id: int, req: StoryUpdate):
         return {"trip_id": trip_id, "story_text": trip.story_text}
 
 
+# --- 旅程參加者（相框 label.json 的資料來源） -------------------------------
+# 板端限制（Slideshow.c）：每相簿最多 8 人、每個 label 最多 23 bytes、
+# label.json 只解析前 512 bytes。label 需與人臉註冊（enroll_<label>.raw）一致。
+
+FRAME_MAX_USERS = 8
+FRAME_USER_MAX_BYTES = 23
+
+
+def trip_members(trip: Trip) -> list[str]:
+    try:
+        v = json.loads(trip.members or "[]")
+        return [str(m) for m in v] if isinstance(v, list) else []
+    except ValueError:
+        return []
+
+
+class MembersUpdate(BaseModel):
+    members: list[str]
+
+
+@app.put("/trips/{trip_id}/members")
+async def update_trip_members(trip_id: int, req: MembersUpdate):
+    cleaned = []
+    for m in req.members:
+        m = m.strip()
+        if not m:
+            continue
+        if len(m.encode("utf-8")) > FRAME_USER_MAX_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"名字「{m}」太長（相框限制 {FRAME_USER_MAX_BYTES} bytes）",
+            )
+        if m not in cleaned:
+            cleaned.append(m)
+    if len(cleaned) > FRAME_MAX_USERS:
+        raise HTTPException(
+            status_code=400, detail=f"最多 {FRAME_MAX_USERS} 位參加者（相框限制）"
+        )
+    async with db.SessionLocal() as session:
+        trip = await get_trip_or_404(session, trip_id)
+        trip.members = json.dumps(cleaned, ensure_ascii=False)
+        await session.commit()
+        return {"trip_id": trip_id, "members": cleaned}
+
+
 # --- 每旅程的板子用媒體檔（M55M1 SD 卡同步用） -----------------------------
 # 以遊記內容 hash 當快取 key：遊記沒變就直接回檔案，變了自動重做。
 # TTS 較慢（~5-10s）用鎖避免同檔並發重做；.tim 渲染快、同步做即可。
@@ -996,6 +1042,19 @@ async def trip_story_wav(trip_id: int):
                     raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
                 print(f"[media] trip {trip_id} wav ready: {f.stat().st_size} bytes")
     return FileResponse(f, media_type="audio/wav", filename=f"t{trip_id}.wav")
+
+
+@app.get("/trips/{trip_id}/label.json")
+async def trip_label_json(trip_id: int):
+    """相簿參加者標籤——板端 Slideshow 的 naive parser 讀這個檔決定
+    人臉辨識後要不要播這本相簿。格式固定 {"users": [...]}，遠小於
+    板端 512-byte 解析上限。"""
+    async with db.SessionLocal() as session:
+        trip = await get_trip_or_404(session, trip_id)
+    return Response(
+        content=json.dumps({"users": trip_members(trip)}, ensure_ascii=False),
+        media_type="application/json",
+    )
 
 
 # ================================================================ App: spots
@@ -1465,14 +1524,19 @@ async def frame_status(frame_id: int):
         return frame_json(frame, await _trip_count(session))
 
 
+# 板端 Slideshow 的相簿上限：LIB_MAX_ALBUMS(16) 含根目錄散照的 pseudo-album，
+# 所以旅程相簿最多 15 本，超過的取最新的。
+FRAME_MAX_ALBUMS = 15
+
+
 @app.get("/frames/{frame_id}/sync")
 async def frame_sync(frame_id: int):
-    """M55M1 同步清單：所有「有內容」（遊記或照片）的旅程與其檔案 URL。
-    範例韌體流程：
-      for trip in items:
-        if SD:/TRIPS/{folder}/VERSION.TXT == trip.version: continue  # 沒變
-        下載 story_txt/story_tim/story_wav 與 photos[].url 進該資料夾
-        寫 VERSION.TXT
+    """M55M1 同步清單——SD 卡結構對齊板端 Slideshow 的相簿架構：
+      0:\\pictures\\<folder>\\  = 一趟旅程一本相簿
+        Pxxxx.JPG   照片（board 尺寸 baseline JPEG）
+        LABEL.JSON  參加者 {"users": [...]}（人臉辨識過濾用）
+        STORY.TXT / STORY.TIM / STORY.WAV  遊記（Slideshow 掃圖時自動略過）
+        VERSION.TXT 韌體自己寫，跟 manifest 的 version 比對，相同→整趟跳過
     """
     async with db.SessionLocal() as session:
         frame = await get_frame_or_404(session, frame_id)
@@ -1480,22 +1544,26 @@ async def frame_sync(frame_id: int):
             (await session.execute(
                 select(Trip)
                 .options(selectinload(Trip.photos))
-                .order_by(Trip.created_at)
+                .order_by(Trip.created_at.desc())
             )).scalars().all()
         )
 
+        with_content = [t for t in trips if t.story_text or t.photos]
+        truncated = len(with_content) > FRAME_MAX_ALBUMS
+        selected = list(reversed(with_content[:FRAME_MAX_ALBUMS]))  # 舊→新排列
+
         items = []
-        for trip in trips:
-            if not trip.story_text and not trip.photos:
-                continue  # 空旅程不佔相框空間
+        for trip in selected:
             date_str = ""
             if trip.start_time:
                 local = trip.start_time.replace(
                     tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
                 date_str = f"{local.year}-{local.month:02d}-{local.day:02d}"
+            members = trip_members(trip)
             version = hashlib.md5(
                 (trip.story_text + "|" + trip.title + "|"
-                 + ",".join(str(ph.id) for ph in trip.photos)).encode("utf-8")
+                 + ",".join(str(ph.id) for ph in trip.photos) + "|"
+                 + ",".join(members)).encode("utf-8")
             ).hexdigest()[:8]
             has_story = bool(trip.story_text)
             items.append({
@@ -1504,6 +1572,8 @@ async def frame_sync(frame_id: int):
                 "title": trip.title or "未命名旅程",
                 "date": date_str,
                 "version": version,
+                "users": members,
+                "label_json": f"/trips/{trip.id}/label.json",
                 "has_story": has_story,
                 "story_txt": f"/trips/{trip.id}/story.txt" if has_story else None,
                 "story_tim": f"/trips/{trip.id}/story.tim" if has_story else None,
@@ -1516,8 +1586,16 @@ async def frame_sync(frame_id: int):
 
         frame.last_sync = db.utcnow()
         await session.commit()
+        if truncated:
+            print(f"[frames] sync truncated to newest {FRAME_MAX_ALBUMS} "
+                  f"of {len(with_content)} trips (board album cap)")
         print(f"[frames] frame {frame_id} sync manifest: {len(items)} trip(s)")
-        return {"trips": items, "count": len(items)}
+        return {
+            "sd_root": "pictures",
+            "trips": items,
+            "count": len(items),
+            "truncated": truncated,
+        }
 
 
 if __name__ == "__main__":
