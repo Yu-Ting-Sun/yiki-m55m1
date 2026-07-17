@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import time
 import uuid
@@ -1469,6 +1470,135 @@ async def delete_saved_spot(trip_id: int, spot_id: int):
         return {"deleted": spot_id}
 
 
+# ================================================================ App: faces
+# App 自拍註冊（隊友 Week-2 README 的「App 註冊」路線）：
+#   App 上傳自拍＋名字 → 這裡轉成板端 photo-enroll 吃的 240x240 RGB565 LE raw
+#   （格式與 scripts/selfie_to_frame.py 完全一致）→ 存 face_store/ →
+#   相框同步時從 manifest 的 faces 段下載進 0:\faces\ → 重開機自動註冊
+#   （韌體 RUN_PHOTO_ENROLL：跑板上偵測+embedding，完成後把檔案改名 .done）。
+
+FACE_DIR = Path(__file__).parent / "face_store"
+FACE_DIR.mkdir(exist_ok=True)
+
+FACE_LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,23}$")
+FACE_FILE_RE = re.compile(r"^enroll_[A-Za-z0-9_-]+(-\d+)?\.raw$")
+FACE_CAM_W = FACE_CAM_H = 240
+FACE_MAX_PHOTOS = 8  # 韌體每次開機最多 enroll 8 張（PHOTO_ENROLL_MAX）
+
+
+def selfie_to_raw(data: bytes, zoom: float = 1.0) -> bytes:
+    """自拍 → 240x240 RGB565 little-endian（scripts/selfie_to_frame.py 的移植，
+    輸出位元組必須完全一致：板端把它當一張相機幀跑偵測+embedding）。"""
+    import io
+
+    from PIL import Image, ImageOps
+
+    img = Image.open(io.BytesIO(data))
+    img = ImageOps.exif_transpose(img)  # 尊重手機拍攝方向
+    img = img.convert("RGB")
+
+    side = int(min(img.size) / max(zoom, 1.0))
+    cx, cy = img.width // 2, img.height // 2
+    img = img.crop((cx - side // 2, cy - side // 2,
+                    cx - side // 2 + side, cy - side // 2 + side))
+    img = img.resize((FACE_CAM_W, FACE_CAM_H), Image.LANCZOS)
+
+    buf = bytearray(FACE_CAM_W * FACE_CAM_H * 2)
+    px = img.load()
+    i = 0
+    for y in range(FACE_CAM_H):
+        for x in range(FACE_CAM_W):
+            r, g, b = px[x, y]
+            v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)  # RGB565
+            buf[i] = v & 0xFF                                  # little-endian
+            buf[i + 1] = v >> 8
+            i += 2
+    return bytes(buf)
+
+
+def _face_label_files(label: str) -> list[Path]:
+    return sorted(
+        p for p in FACE_DIR.glob(f"enroll_{label}*.raw")
+        if p.name == f"enroll_{label}.raw"
+        or re.fullmatch(rf"enroll_{re.escape(label)}-\d+\.raw", p.name)
+    )
+
+
+@app.post("/faces/enroll")
+async def enroll_face(
+    label: str = Form(...),
+    zoom: float = Form(1.0),
+    files: list[UploadFile] = File(...),
+):
+    label = label.strip()
+    if not FACE_LABEL_RE.match(label):
+        raise HTTPException(
+            status_code=400,
+            detail="名字只能用英數字、底線、連字號（1-23 字元），"
+            "且要跟旅程參加者用同一個名字",
+        )
+    if not files or len(files) > FACE_MAX_PHOTOS:
+        raise HTTPException(
+            status_code=400, detail=f"一次 1 到 {FACE_MAX_PHOTOS} 張自拍"
+        )
+
+    for old in _face_label_files(label):  # 重新註冊 = 整組換新
+        old.unlink(missing_ok=True)
+
+    written = []
+    for i, f in enumerate(files, start=1):
+        data = await f.read()
+        if not data:
+            continue
+        try:
+            raw = await asyncio.to_thread(selfie_to_raw, data, zoom)
+        except Exception as e:  # noqa: BLE001 — 壞圖檔
+            raise HTTPException(status_code=400, detail=f"照片解析失敗：{e}")
+        suffix = "" if i == 1 else f"-{i}"
+        p = FACE_DIR / f"enroll_{label}{suffix}.raw"
+        p.write_bytes(raw)
+        written.append(p.name)
+
+    print(f"[faces] enrolled '{label}': {len(written)} photo(s)")
+    return {"label": label, "files": written}
+
+
+@app.get("/faces")
+async def list_faces():
+    labels: dict[str, int] = {}
+    for p in sorted(FACE_DIR.glob("enroll_*.raw")):
+        if not FACE_FILE_RE.match(p.name):
+            continue
+        base = re.sub(r"-\d+$", "", p.stem[len("enroll_"):])
+        labels[base] = labels.get(base, 0) + 1
+    return {"faces": [
+        {"label": k, "photo_count": v} for k, v in sorted(labels.items())
+    ]}
+
+
+@app.delete("/faces/{label}")
+async def delete_face(label: str):
+    if not FACE_LABEL_RE.match(label):
+        raise HTTPException(status_code=400, detail="invalid label")
+    removed = _face_label_files(label)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"未註冊：{label}")
+    for p in removed:
+        p.unlink(missing_ok=True)
+    return {"deleted": label, "files": len(removed)}
+
+
+@app.get("/faces/file/{name}")
+async def get_face_file(name: str):
+    """M55M1 同步下載用：faces manifest 裡的 raw 檔。"""
+    if not FACE_FILE_RE.match(name):
+        raise HTTPException(status_code=400, detail="invalid face file name")
+    p = FACE_DIR / name
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"unknown face file {name}")
+    return FileResponse(p, media_type="application/octet-stream")
+
+
 # ================================================================ App: frames
 # 相框同步（App Stage 5，整批模式）：App 用配對碼配對；M55M1 輪詢
 # GET /frames/{id}/sync 拿「全部旅程」的檔案清單，逐檔下載到 SD 卡、
@@ -1584,15 +1714,31 @@ async def frame_sync(frame_id: int):
                 ],
             })
 
+        # 自拍註冊檔 → 0:\faces\。version=內容 hash：韌體端若同名 .done 的
+        # version 相同就跳過（避免每次同步都重複註冊）。
+        faces = []
+        for p in sorted(FACE_DIR.glob("enroll_*.raw")):
+            if not FACE_FILE_RE.match(p.name):
+                continue
+            faces.append({
+                "name": p.name,
+                "url": f"/faces/file/{p.name}",
+                "size": p.stat().st_size,
+                "version": hashlib.md5(p.read_bytes()).hexdigest()[:8],
+            })
+
         frame.last_sync = db.utcnow()
         await session.commit()
         if truncated:
             print(f"[frames] sync truncated to newest {FRAME_MAX_ALBUMS} "
                   f"of {len(with_content)} trips (board album cap)")
-        print(f"[frames] frame {frame_id} sync manifest: {len(items)} trip(s)")
+        print(f"[frames] frame {frame_id} sync manifest: "
+              f"{len(items)} trip(s), {len(faces)} face file(s)")
         return {
             "sd_root": "pictures",
+            "faces_root": "faces",
             "trips": items,
+            "faces": faces,
             "count": len(items),
             "truncated": truncated,
         }

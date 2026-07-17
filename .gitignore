@@ -27,3 +27,6 @@ Thumbs.db
 
 # Frame-sync media cache (per-trip TTS/textimg/board photos)
 backend/trip_media/
+
+# Face enrollment uploads (selfie raw files served to the frame)
+backend/face_store/

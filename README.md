@@ -156,7 +156,7 @@ CCAP/HM1055 240×240 RGB565（一次性觸發擷取）
 |---|---|---|
 | **照片註冊**（預設開） | `python scripts/selfie_to_frame.py --label user1 自拍.jpg`（可一次多張）→ 產出的 `enroll_user1.raw` 丟進 SD `faces\` → 重開機自動註冊，完成後改名 `.done` | App 註冊路線的裝置端；**不用重燒韌體** |
 | 現場註冊（`RUN_FACE_ENROLL=1` 重燒） | 站在鏡頭前，開機自動連拍 8 張取樣寫入 SD | 參考品質最好（live cosine 0.8+） |
-| App 註冊（未實作，見交接注意） | App 上傳自拍＋名字 → 後端轉 raw 下發 SD → 重開機 | 產品最終形態 |
+| **App 註冊（後端已實作）** | App 相框頁「家人臉譜」上傳自拍＋名字 → 後端 `POST /faces/enroll` 轉 raw（與 selfie_to_frame.py 位元組一致）→ 同步 manifest 的 `faces` 段列出檔案與 version → 韌體下載進 SD `faces\` → 重開機自動註冊。韌體端下載時若同名 `.done` 的 version 相同應跳過，避免重複註冊 | 產品最終形態；剩韌體同步迴圈 |
 
 ### 調參
 
