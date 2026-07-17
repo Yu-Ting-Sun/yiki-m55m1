@@ -24,3 +24,6 @@ Thumbs.db
 
 # Editor/tool backup files
 *.bak
+
+# Frame-sync media cache (per-trip TTS/textimg/board photos)
+backend/trip_media/

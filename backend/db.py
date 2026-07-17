@@ -70,6 +70,21 @@ class Photo(Base):
     trip: Mapped[Trip] = relationship(back_populates="photos")
 
 
+class TripSpot(Base):
+    """使用者在記錄中從「附近景點」親手收藏進旅程的地點。"""
+
+    __tablename__ = "trip_spots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trip_id: Mapped[int] = mapped_column(ForeignKey("trips.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    lat: Mapped[float] = mapped_column(Float)
+    lng: Mapped[float] = mapped_column(Float)
+    category: Mapped[str] = mapped_column(String(50), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+
+
 class Frame(Base):
     __tablename__ = "frames"
 

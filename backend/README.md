@@ -13,8 +13,8 @@ M55M1 → ESP-12F → Wi-Fi → 這個後端。端點：
 ## Day-3 依賴與環境變數
 
 ```powershell
-pip install -r requirements.txt
-# ffmpeg 需在 PATH — 只有語音端點 /audio 需要（Day-3 相框已不播語音，可略過）
+pip install fastapi uvicorn litellm edge-tts   # 已裝進 m55m1_face env
+# ffmpeg 需在 PATH（已確認 winget 版 OK）
 
 # 預設走 NCKU NetDB LiteLLM proxy（https://litellm.netdb.csie.ncku.edu.tw，
 # 已內建為預設 LLM_API_BASE）、模型 gemini-3-flash。只需設 proxy 發的 key：

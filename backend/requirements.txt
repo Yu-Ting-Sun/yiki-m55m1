@@ -5,3 +5,5 @@ pillow
 sqlalchemy
 aiosqlite
 edge-tts
+python-multipart
+httpx
