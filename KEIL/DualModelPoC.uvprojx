@@ -518,6 +518,11 @@
               <FilePath>..\Slideshow.c</FilePath>
             </File>
             <File>
+              <FileName>SdSync.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\SdSync.c</FilePath>
+            </File>
+            <File>
               <FileName>StoryUI.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\StoryUI.c</FilePath>

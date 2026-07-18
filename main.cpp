@@ -38,6 +38,7 @@
 #include "esp_probe.h"
 #include "day2_test.h"
 #include "day3_demo.h"
+#include "SdSync.h"
 #include "ff.h"                   /* photo-enroll one-shot reads the SD */
 
 /* 1 = Day-2 Task 0: ESP-12F firmware probe. Runs INSTEAD of everything else
@@ -59,6 +60,15 @@
  *     Story failure is non-fatal (photos still run). Never returns.
  *     Priority: RUN_ESP_PROBE > RUN_DAY2_TESTS > RUN_DAY3_DEMO > slideshow. */
 #define RUN_DAY3_DEMO      (1)
+
+/* 1 = SD sync over Wi-Fi (the App-to-frame pipe, no card swapping): pull
+ *     GET /frames/1/sync at boot and every SDSYNC_POLL_MS between photos —
+ *     new/changed albums (photos + LABEL.JSON + STORY.TIM + VERSION.TXT)
+ *     and faces\enroll_*.raw are downloaded straight onto the SD card.
+ *     Fails soft: no Wi-Fi/backend -> whatever is on the card keeps playing.
+ *     New enroll files still need one reboot (enrollment runs at boot). */
+#define RUN_SD_SYNC        (1)
+#define SDSYNC_POLL_MS     (60000u)
 
 /* 1 = photo-frame mode: show 0:\pictures\*.bmp on the LCD forever and skip
  *     the dual-model tests (falls through to the tests only if the slideshow
@@ -521,6 +531,13 @@ int main(void)
         if (d3 != 0)
             printf_err("Day-3 story failed (rc=%d) - running photos only\n", d3);
 
+#if RUN_SD_SYNC
+        /* Boot sync BEFORE the library scan and photo enrollment, so albums
+         * and enroll files pushed from the App are picked up this boot. */
+        if (SdSync_Run(true) > 0)
+            printf("[MAIN] SD content updated from backend\n");
+#endif
+
         Slideshow_ReserveRight(STORYUI_RESERVED_PX);
         Slideshow_SetFilter(SLIDESHOW_SIM_USER);
 
@@ -665,6 +682,26 @@ int main(void)
             {
                 slrc = Slideshow_ShowNext();
                 if (slrc != 0) break;
+
+#if RUN_SD_SYNC
+                /* Periodic pull between photos: cheap manifest check; only
+                 * albums whose version changed actually download. On fresh
+                 * content, rescan the library so it enters the rotation. */
+                {
+                    static uint32_t s_lastSyncMs = 0;
+                    uint32_t now = GetSystemTick_ms();
+
+                    if (now - s_lastSyncMs >= SDSYNC_POLL_MS)
+                    {
+                        s_lastSyncMs = now;
+                        if (SdSync_Run(false) > 0)
+                        {
+                            Slideshow_LibScan(SLIDESHOW_DIR);
+                            continue;           /* show the new content now */
+                        }
+                    }
+                }
+#endif
 
                 /* Hold window: this idle time is where the camera (and later
                  * the face-recognition inference) runs. */
