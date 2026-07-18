@@ -47,6 +47,11 @@ void StoryUI_DrawChrome(void);
  *  @return 0 ok; -1 bad header; -2 size mismatch; -3 too large. */
 int StoryUI_ShowTextImage(const uint8_t *tim, uint32_t len);
 
+/** Load a TIM4 file from SD (e.g. "0:\\pictures\\T0007\\STORY.TIM" written
+ *  by the backend sync / scripts/export_sd.py) and blit it into the panel.
+ *  @return 0 ok; -4 open failed; -5 read failed; else ShowTextImage codes. */
+int StoryUI_ShowTextImageFile(const char *path);
+
 /** One line of ASCII status ("Generating story...") centered in the panel. */
 void StoryUI_ShowStatus(const char *asciiText);
 

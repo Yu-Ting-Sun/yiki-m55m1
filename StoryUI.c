@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "Display.h"
+#include "ff.h"
 
 /* Palette (RGB565): warm dark background, warm white text, amber divider. */
 #define UI_BG_COLOR     (0x18A2u)   /* #181410 */
@@ -59,6 +60,28 @@ void StoryUI_DrawChrome(void)
 {
     fill_rect(UI_DIVIDER, STORYUI_DIVIDER_X, 0, STORYUI_DIVIDER_W, STORYUI_PANEL_H);
     fill_rect(UI_BG_COLOR, STORYUI_PANEL_X, 0, STORYUI_PANEL_W, STORYUI_PANEL_H);
+}
+
+/* File buffer for StoryUI_ShowTextImageFile: a full-panel TIM4 fits exactly.
+ * SRAM2 like the band buffer (CPU-only; models/NPU never touch it). */
+__attribute__((section(".bss.vram.data"), aligned(32)))
+static uint8_t s_timFileBuf[STORYUI_TIM4_MAX];
+
+static FIL s_timFile;   /* FIL is large; keep off the stack */
+
+int StoryUI_ShowTextImageFile(const char *path)
+{
+    FRESULT res;
+    UINT    br = 0;
+
+    if (f_open(&s_timFile, path, FA_OPEN_EXISTING | FA_READ) != FR_OK)
+        return -4;
+    res = f_read(&s_timFile, s_timFileBuf, sizeof(s_timFileBuf), &br);
+    f_close(&s_timFile);
+    if (res != FR_OK || br < 8u)
+        return -5;
+
+    return StoryUI_ShowTextImage(s_timFileBuf, (uint32_t)br);
 }
 
 int StoryUI_ShowTextImage(const uint8_t *tim, uint32_t len)

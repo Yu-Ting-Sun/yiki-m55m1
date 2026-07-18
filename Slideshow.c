@@ -28,6 +28,7 @@
 #include "ff.h"
 #include "Display.h"
 #include "MemoryLayout.h"   /* SLIDESHOW_FB_ADDR / _SIZE */
+#include "StoryUI.h"        /* story rail follows the album on screen */
 #include "tjpgd.h"
 
 /* Show the file name in the bottom-left corner of each photo. */
@@ -376,6 +377,13 @@ static bool    s_iterOpen;
 static uint8_t s_cursor;                     /* index into s_matched */
 static uint8_t s_albumsDone;                 /* albums exhausted this cycle */
 static uint32_t s_shownInCycle;
+static uint32_t s_photosThisAlbum;           /* photos shown since album open */
+
+/* Story rail state: which album's STORY.TIM is on the rail right now.
+ * STORY.TIM sits next to the photos (backend sync / scripts/export_sd.py). */
+#define ALBUM_STORY_FILE    "STORY.TIM"
+static uint8_t s_storyAlbum = 0xFF;          /* album index shown in the rail */
+static bool    s_storyHasStory = false;      /* rail shows a story (vs empty) */
 
 static bool str_ieq(const char *a, const char *b)
 {
@@ -459,6 +467,36 @@ static void lib_apply_filter(void)
     s_restart = true;
 }
 
+/* Story rail follows the album on screen. Returns 0 iff the rail now shows
+ * this album's story; albums without STORY.TIM (incl. the loose-file
+ * pseudo-album) get the empty panel back. */
+static int story_follow_album(uint8_t albumIdx)
+{
+    const Album *al;
+    char path[300];
+    int  rc = -4;
+
+    if (albumIdx == s_storyAlbum)               /* rail already up to date */
+        return s_storyHasStory ? 0 : -1;
+
+    al = &s_albums[albumIdx];
+    if (al->name[0])
+    {
+        snprintf(path, sizeof(path), "%s\\%s\\" ALBUM_STORY_FILE,
+                 s_root, al->name);
+        rc = StoryUI_ShowTextImageFile(path);
+    }
+
+    if (rc == 0)
+        printf("[SLIDESHOW] story rail -> album '%s'\n", al->name);
+    else
+        StoryUI_DrawChrome();                   /* no story: empty panel */
+
+    s_storyAlbum    = albumIdx;
+    s_storyHasStory = (rc == 0);
+    return s_storyHasStory ? 0 : -1;
+}
+
 int Slideshow_LibScan(const char *rootPath)
 {
     DIR     dir;
@@ -466,6 +504,10 @@ int Slideshow_LibScan(const char *rootPath)
     TCHAR   drv[] = { '0', ':', 0 };
 
     f_chdrive(drv);
+
+    /* Album indices are about to change; forget what the rail shows. */
+    s_storyAlbum    = 0xFF;
+    s_storyHasStory = false;
 
     strncpy(s_root, rootPath, sizeof(s_root) - 1);
     s_root[sizeof(s_root) - 1] = 0;
@@ -585,6 +627,7 @@ int Slideshow_ShowNext(void)
                 continue;
             }
             s_iterOpen = true;
+            s_photosThisAlbum = 0;
         }
 
         if (f_readdir(&s_iterDir, &fno) != FR_OK)
@@ -596,10 +639,22 @@ int Slideshow_ShowNext(void)
 
         if (fno.fname[0] == 0)                  /* album exhausted */
         {
+            uint8_t doneIdx = s_matched[s_cursor];
+
             f_closedir(&s_iterDir);
             s_iterOpen = false;
             s_albumsDone++;
             s_cursor = (uint8_t)((s_cursor + 1) % s_nMatched);
+
+            /* Story-only album (a trip with a story but no photos yet):
+             * the story itself is the slide — black photo region + rail. */
+            if (s_photosThisAlbum == 0 && story_follow_album(doneIdx) == 0)
+            {
+                S_DISP_RECT r = { 0, 0, panelW - 1u, panelH - 1u };
+                Display_ClearRect(C_BLACK, &r);
+                s_shownInCycle++;
+                return 0;
+            }
             continue;
         }
 
@@ -644,6 +699,10 @@ int Slideshow_ShowNext(void)
                             4, panelH - 20, C_WHITE, C_BLACK, false, 1);
         }
 #endif
+        /* Photo is up: make the story rail match the album it came from. */
+        story_follow_album(s_matched[s_cursor]);
+
+        s_photosThisAlbum++;
         s_shownInCycle++;
         return 0;
     }
