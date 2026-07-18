@@ -1290,8 +1290,26 @@ async def build_spot_pool(trip_id: int, pts: list[tuple[float, float]],
 
 NEARBY_RADIUS_M = 400
 NEARBY_TTL_S = 600
-# key -> (monotonic, spots, described)
-_NEARBY_CACHE: dict[tuple[float, float], tuple[float, list[dict], bool]] = {}
+# 兩層快取（同 grid key）：
+#   _NEARBY_POOL   完整候選池——「重新推薦」換組時重用，不重打 Overpass
+#   _NEARBY_RESULT 上次回傳的清單（含已寫介紹旗標），非 refresh 時秒回
+_NEARBY_POOL: dict[tuple[float, float], tuple[float, list[dict]]] = {}
+_NEARBY_RESULT: dict[tuple[float, float], tuple[float, list[dict], bool]] = {}
+
+
+async def _nearby_pool(
+    key: tuple[float, float], lat: float, lng: float
+) -> list[dict]:
+    hit = _NEARBY_POOL.get(key)
+    if hit and time.monotonic() - hit[0] < NEARBY_TTL_S:
+        return hit[1]
+    async with httpx.AsyncClient() as client:
+        elements = await overpass_pois(
+            client, [(lat, lng)], total_budget_s=25, radius_m=NEARBY_RADIUS_M
+        )
+    candidates = parse_overpass_elements(elements, [(lat, lng)])
+    _NEARBY_POOL[key] = (time.monotonic(), candidates)
+    return candidates
 
 
 async def _describe_spots(spots: list[dict]) -> None:
@@ -1316,26 +1334,27 @@ async def _describe_spots(spots: list[dict]) -> None:
 
 
 @app.get("/spots/nearby")
-async def nearby_spots(lat: float, lng: float, describe: bool = False):
+async def nearby_spots(
+    lat: float, lng: float, describe: bool = False, refresh: bool = False
+):
     key = (round(lat, 3), round(lng, 3))
-    hit = _NEARBY_CACHE.get(key)
-    if hit and time.monotonic() - hit[0] < NEARBY_TTL_S:
-        ts, spots, described = hit
-        if describe and not described:
-            await _describe_spots(spots)
-            _NEARBY_CACHE[key] = (ts, spots, True)
-        return {"spots": spots, "cached": True}
+    if not refresh:
+        hit = _NEARBY_RESULT.get(key)
+        if hit and time.monotonic() - hit[0] < NEARBY_TTL_S:
+            ts, spots, described = hit
+            if describe and not described:
+                await _describe_spots(spots)
+                _NEARBY_RESULT[key] = (ts, spots, True)
+            return {"spots": spots, "cached": True}
 
-    async with httpx.AsyncClient() as client:
-        elements = await overpass_pois(
-            client, [(lat, lng)], total_budget_s=25, radius_m=NEARBY_RADIUS_M
-        )
-    spots = balanced_pick(parse_overpass_elements(elements, [(lat, lng)]), 10)
+    candidates = await _nearby_pool(key, lat, lng)
+    # refresh：從最近的候選裡隨機換一組（美食/景點仍平衡），不重打 Overpass
+    spots = balanced_pick(candidates, 10, shuffle=refresh)
     if describe:
         await _describe_spots(spots)
-    _NEARBY_CACHE[key] = (time.monotonic(), spots, describe)
+    _NEARBY_RESULT[key] = (time.monotonic(), spots, describe)
     print(f"[spots] nearby ({lat:.4f},{lng:.4f}): {len(spots)} POIs "
-          f"(describe={describe})")
+          f"(refresh={refresh}, describe={describe})")
     return {"spots": spots, "cached": False}
 
 
