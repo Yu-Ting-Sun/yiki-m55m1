@@ -30,3 +30,4 @@ backend/trip_media/
 
 # Face enrollment uploads (selfie raw files served to the frame)
 backend/face_store/
+KEIL/build_log.txt
