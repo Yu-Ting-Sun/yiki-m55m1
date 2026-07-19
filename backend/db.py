@@ -38,6 +38,9 @@ class Trip(Base):
     # 參加者（JSON list of face labels，例 '["dad","mom"]'）——
     # 相框 label.json 的資料來源，需與板端人臉註冊的 label 一致。
     members: Mapped[str] = mapped_column(Text, default="[]")
+    # 這趟旅程屬於哪台相框（App 建立旅程時帶當時配對的 frame_id）；
+    # NULL = 不限相框（舊資料相容：所有相框都會同步到）。
+    frame_id: Mapped[int | None] = mapped_column(Integer, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
 
     points: Mapped[list["GpsPoint"]] = relationship(
@@ -95,19 +98,31 @@ class Frame(Base):
     pair_code: Mapped[str] = mapped_column(String(6), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(100), default="智慧相框")
     last_sync: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    # 板子的硬體身分（ESP MAC）；板子開機 POST /frames/register 用它換
+    # 自己的 frame_id + 配對碼（重複註冊回同一筆）。
+    device_uid: Mapped[str | None] = mapped_column(String(32), unique=True, default=None)
+    # App 按「立即同步」立旗；板子輪詢 /pending 看到才真正拉 /sync（拉完清旗）。
+    sync_requested: Mapped[int] = mapped_column(Integer, default=0)
 
 
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # 輕量 migration：create_all 不會幫既有資料表加欄位，
-        # 舊 yiki.db 的 trips 沒有 members 就補上。
-        cols = (await conn.execute(text("PRAGMA table_info(trips)"))).fetchall()
-        if not any(c[1] == "members" for c in cols):
-            await conn.execute(
-                text("ALTER TABLE trips ADD COLUMN members TEXT NOT NULL DEFAULT '[]'")
-            )
-            print("[db] migrated: trips.members added")
+        # 輕量 migration：create_all 不會幫既有資料表加欄位。
+        async def add_missing(table: str, column: str, ddl: str) -> None:
+            cols = (await conn.execute(
+                text(f"PRAGMA table_info({table})"))).fetchall()
+            if not any(c[1] == column for c in cols):
+                await conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                print(f"[db] migrated: {table}.{column} added")
+
+        await add_missing("trips", "members",
+                          "members TEXT NOT NULL DEFAULT '[]'")
+        await add_missing("trips", "frame_id", "frame_id INTEGER")
+        await add_missing("frames", "device_uid", "device_uid VARCHAR(32)")
+        await add_missing("frames", "sync_requested",
+                          "sync_requested INTEGER NOT NULL DEFAULT 0")
 
 
 def utcnow() -> datetime:

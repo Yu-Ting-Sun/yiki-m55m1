@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "ff.h"
+#include "Display.h"        /* Display_Delay (pair-code hold) */
 #include "MemoryLayout.h"   /* SLIDESHOW_FB_ADDR / _SIZE (download buffer) */
 #include "StoryUI.h"
 #include "esp_at.h"
@@ -44,9 +45,9 @@
 #include "day2_config.h"
 #endif
 
-#define SYNC_FRAME_ID       (1)         /* demo frame seeded by the backend */
 #define SYNC_MANIFEST_TMO   (15000)
 #define SYNC_FILE_TMO       (30000)     /* enroll raw 115 KB @ ~11.5 KB/s   */
+#define PAIR_CODE_SHOW_MS   (5000)      /* pair code on the rail at boot    */
 
 /* Slideshow frame buffer, borrowed while the slideshow is between photos:
  * first 768 KB = file downloads, last 256 KB = manifest text. */
@@ -55,7 +56,8 @@
 #define MAN_BUF     ((char *)(SLIDESHOW_FB_ADDR + DL_CAP))
 #define MAN_CAP     ((int)SLIDESHOW_FB_SIZE - DL_CAP)
 
-static bool s_wifiUp = false;
+static bool s_wifiUp  = false;
+static int  s_frameId = 1;              /* until /frames/register answers   */
 static FIL  s_file;                     /* FIL is large; keep off the stack */
 
 /*----------------------------------------------------------------------------
@@ -251,13 +253,116 @@ static int wifi_up(void)
 {
     char ip[20];
 
+    if (s_wifiUp)
+        return 0;
+
+    /* The Day-3 demo may have joined already: a working CIFSR is enough. */
+    if (esp_wifi_get_ip(ip) == ESP_OK)
+    {
+        s_wifiUp = true;
+        return 0;
+    }
+
     if (esp_at_init() != ESP_OK)        return -1;
     if (esp_wifi_set_mode(1) != ESP_OK) return -2;
     if (esp_wifi_connect(WIFI_SSID, WIFI_PWD) != ESP_OK) return -3;
     if (esp_wifi_get_ip(ip) != ESP_OK)  return -4;
 
     printf("[SYNC] WiFi up, IP %s\n", ip);
+    s_wifiUp = true;
     return 0;
+}
+
+
+/* Parse the integer value of `"key": 123`. Returns fallback when absent. */
+static int get_int(const char *obj, const char *end, const char *key, int fallback)
+{
+    const char *p = find_key(obj, end, key);
+    int v = 0;
+    bool any = false;
+
+    if (!p) return fallback;
+    while (p < end && (*p == ':' || *p == ' ')) p++;
+    while (p < end && *p >= '0' && *p <= '9')
+    {
+        v = v * 10 + (*p - '0');
+        p++;
+        any = true;
+    }
+    return any ? v : fallback;
+}
+
+
+/* POST /frames/register with the ESP MAC; adopt the returned frame_id and
+ * show the pair code on the story rail so the App can pair. Best-effort:
+ * on failure the board keeps the default frame id. */
+static void register_frame(void)
+{
+    char mac[20], body[64], resp[192], code[16], msg[24];
+
+    if (esp_wifi_get_mac(mac) != ESP_OK)
+    {
+        printf("[SYNC] no MAC; keeping frame id %d\n", s_frameId);
+        return;
+    }
+
+    snprintf(body, sizeof(body), "{\"device_uid\": \"%s\"}", mac);
+    int st = http_post_json(BACKEND_HOST, BACKEND_PORT, "/frames/register",
+                            body, resp, sizeof(resp));
+    if (st != 200)
+    {
+        printf("[SYNC] register failed (%d); keeping frame id %d\n",
+               st, s_frameId);
+        return;
+    }
+
+    const char *end = resp + strlen(resp);
+    s_frameId = get_int(resp, end, "frame_id", s_frameId);
+
+    if (get_str(resp, end, "pair_code", code, sizeof(code)) == 0)
+    {
+        snprintf(msg, sizeof(msg), "Pair: %s", code);
+        StoryUI_ShowStatus(msg);
+        printf("[SYNC] frame id %d, pair code %s (shown on rail)\n",
+               s_frameId, code);
+        Display_Delay(PAIR_CODE_SHOW_MS);
+    }
+}
+
+
+/* Does the SD already have at least one album folder? */
+static bool albums_present(const char *sdRoot)
+{
+    char dirPath[32];
+    DIR  dir;
+    FILINFO fno;
+    bool found = false;
+
+    snprintf(dirPath, sizeof(dirPath), "0:\\%s", sdRoot);
+    if (f_opendir(&dir, dirPath) != FR_OK)
+        return false;
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0])
+    {
+        if (fno.fattrib & AM_DIR)
+        {
+            found = true;
+            break;
+        }
+    }
+    f_closedir(&dir);
+    return found;
+}
+
+
+/* Tiny doorbell request: has the App pressed 「立即同步」? */
+static bool check_pending(void)
+{
+    char path[40], resp[64];
+
+    snprintf(path, sizeof(path), "/frames/%d/pending", s_frameId);
+    if (http_get(BACKEND_HOST, BACKEND_PORT, path, resp, sizeof(resp)) != 200)
+        return false;
+    return strstr(resp, "true") != NULL;
 }
 
 /*----------------------------------------------------------------------------
@@ -361,35 +466,19 @@ static int sync_faces(const char *man, const char *end, const char *facesRoot)
 
 int SdSync_Run(bool verbose)
 {
-    char path[32];
+    char path[40];
     int  blen = 0, st;
 
-    snprintf(path, sizeof(path), "/frames/%d/sync", SYNC_FRAME_ID);
+    snprintf(path, sizeof(path), "/frames/%d/sync", s_frameId);
 
     st = http_get_binary(BACKEND_HOST, BACKEND_PORT, path,
                          (uint8_t *)MAN_BUF, MAN_CAP - 1, &blen,
                          SYNC_MANIFEST_TMO);
-    if (st < 0 && !s_wifiUp)
-    {
-        /* First contact (or the Day-3 demo never joined): bring Wi-Fi up. */
-        if (verbose) StoryUI_ShowStatus("WiFi connecting");
-        if (wifi_up() != 0)
-        {
-            if (verbose) StoryUI_ShowStatus("WiFi failed");
-            printf("[SYNC] WiFi bring-up failed\n");
-            return -1;
-        }
-        s_wifiUp = true;
-        st = http_get_binary(BACKEND_HOST, BACKEND_PORT, path,
-                             (uint8_t *)MAN_BUF, MAN_CAP - 1, &blen,
-                             SYNC_MANIFEST_TMO);
-    }
     if (st < 0)
     {
         printf("[SYNC] manifest transport error %d\n", st);
         return -2;
     }
-    s_wifiUp = true;                    /* a served request proves the link */
     if (st != 200)
     {
         printf("[SYNC] manifest HTTP %d\n", st);
@@ -429,4 +518,36 @@ int SdSync_Run(bool verbose)
     if (changed)
         printf("[SYNC] %d album(s) updated\n", changed);
     return changed;
+}
+
+int SdSync_Boot(void)
+{
+    StoryUI_ShowStatus("WiFi connecting");
+    if (wifi_up() != 0)
+    {
+        StoryUI_ShowStatus("Offline mode");
+        printf("[SYNC] WiFi bring-up failed - offline, card content only\n");
+        return -1;
+    }
+
+    register_frame();                   /* identity + pair code on the rail */
+
+    /* First run (blank card) bootstraps unconditionally; otherwise only
+     * when the App already pressed 「立即同步」 while we were off. */
+    if (!albums_present("pictures") || check_pending())
+        return SdSync_Run(true);
+
+    printf("[SYNC] frame %d ready; waiting for app sync requests\n", s_frameId);
+    return 0;
+}
+
+int SdSync_Poll(void)
+{
+    if (!s_wifiUp)
+        return -1;                      /* boot never got online */
+    if (!check_pending())
+        return 0;
+
+    printf("[SYNC] app requested sync\n");
+    return SdSync_Run(false);
 }

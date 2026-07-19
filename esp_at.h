@@ -61,6 +61,8 @@ int esp_at_check(void);        /* AT -> OK */
 int esp_wifi_set_mode(int mode);                          /* AT+CWMODE_CUR (1=STA) */
 int esp_wifi_connect(const char *ssid, const char *pwd);  /* AT+CWJAP_CUR, <=20 s */
 int esp_wifi_get_ip(char *ip_out);                        /* AT+CIFSR; >=16 bytes */
+int esp_wifi_get_mac(char *mac_out);                      /* AT+CIFSR STAMAC; >=18 bytes
+                                                             ("aa:bb:cc:dd:ee:ff") */
 
 /*---------------------------------------------------------------------------
  * AT layer — single TCP connection (CIPMUX=0)

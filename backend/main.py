@@ -387,6 +387,8 @@ async def get_audio(audio_id: str):
 
 class TripStartRequest(BaseModel):
     title: str = ""
+    # App 當時配對的相框；同步時只有這台（或未指定的舊旅程）會拿到這趟。
+    frame_id: int | None = None
 
 
 class PointIn(BaseModel):
@@ -428,10 +430,11 @@ async def get_trip_or_404(session, trip_id: int, *, with_children: bool = False)
 @app.post("/trips/start")
 async def start_trip(req: TripStartRequest):
     async with db.SessionLocal() as session:
-        trip = Trip(title=req.title.strip(), start_time=db.utcnow())
+        trip = Trip(title=req.title.strip(), start_time=db.utcnow(),
+                    frame_id=req.frame_id)
         session.add(trip)
         await session.commit()
-        print(f"[trips] started trip {trip.id}")
+        print(f"[trips] started trip {trip.id} (frame={req.frame_id})")
         return {"trip_id": trip.id, "start_time": db.iso_z(trip.start_time)}
 
 
@@ -1649,8 +1652,72 @@ async def get_frame_or_404(session, frame_id: int) -> Frame:
     return frame
 
 
-async def _trip_count(session) -> int:
-    return len((await session.execute(select(Trip.id))).scalars().all())
+def _frame_trip_filter(frame_id: int):
+    """這台相框看得到的旅程：指定給它的 + 未指定的（舊資料相容）。"""
+    return (Trip.frame_id == frame_id) | (Trip.frame_id.is_(None))
+
+
+async def _trip_count(session, frame_id: int) -> int:
+    return len((await session.execute(
+        select(Trip.id).where(_frame_trip_filter(frame_id))
+    )).scalars().all())
+
+
+class RegisterRequest(BaseModel):
+    device_uid: str
+
+
+@app.post("/frames/register")
+async def register_frame(req: RegisterRequest):
+    """板子開機自報身分（ESP MAC）。同一台永遠拿回同一筆 frame；
+    新板子建檔並發一組唯一的 6 位配對碼（板子把它顯示在 LCD 上）。"""
+    uid = req.device_uid.strip().lower()
+    if not uid or len(uid) > 32:
+        raise HTTPException(status_code=400, detail="bad device_uid")
+    async with db.SessionLocal() as session:
+        frame = (
+            await session.execute(
+                select(Frame).where(Frame.device_uid == uid))
+        ).scalar_one_or_none()
+        if frame is None:
+            for _ in range(20):  # 6 位數字、避開既有碼（含 demo 的 123456）
+                code = f"{random.randint(0, 999999):06d}"
+                clash = (await session.execute(
+                    select(Frame.id).where(Frame.pair_code == code)
+                )).scalar_one_or_none()
+                if clash is None:
+                    break
+            else:
+                raise HTTPException(status_code=500, detail="pair code space busy")
+            frame = Frame(pair_code=code, device_uid=uid)
+            session.add(frame)
+            await session.commit()
+            print(f"[frames] registered new frame {frame.id} "
+                  f"(uid={uid}, code={code})")
+        return {
+            "frame_id": frame.id,
+            "pair_code": frame.pair_code,
+            "name": frame.name,
+        }
+
+
+@app.post("/frames/{frame_id}/request-sync")
+async def request_sync(frame_id: int):
+    """App 的「立即同步」：立旗，板子下次問 /pending 就會來拉 /sync。"""
+    async with db.SessionLocal() as session:
+        frame = await get_frame_or_404(session, frame_id)
+        frame.sync_requested = 1
+        await session.commit()
+        print(f"[frames] frame {frame_id}: sync requested")
+        return {"requested": True}
+
+
+@app.get("/frames/{frame_id}/pending")
+async def sync_pending(frame_id: int):
+    """板子的門鈴輪詢（超小回應）；旗子由 /sync 拉取時清除。"""
+    async with db.SessionLocal() as session:
+        frame = await get_frame_or_404(session, frame_id)
+        return {"pending": bool(frame.sync_requested)}
 
 
 @app.post("/frames/pair")
@@ -1663,14 +1730,14 @@ async def pair_frame(req: PairRequest):
         if frame is None:
             raise HTTPException(status_code=404, detail="配對碼錯誤，請確認相框螢幕上的 6 位數字")
         print(f"[frames] paired frame {frame.id} ({frame.name})")
-        return frame_json(frame, await _trip_count(session))
+        return frame_json(frame, await _trip_count(session, frame.id))
 
 
 @app.get("/frames/{frame_id}")
 async def frame_status(frame_id: int):
     async with db.SessionLocal() as session:
         frame = await get_frame_or_404(session, frame_id)
-        return frame_json(frame, await _trip_count(session))
+        return frame_json(frame, await _trip_count(session, frame_id))
 
 
 # 板端 Slideshow 的相簿上限：LIB_MAX_ALBUMS(16) 含根目錄散照的 pseudo-album，
@@ -1692,6 +1759,7 @@ async def frame_sync(frame_id: int):
         trips = (
             (await session.execute(
                 select(Trip)
+                .where(_frame_trip_filter(frame_id))
                 .options(selectinload(Trip.photos))
                 .order_by(Trip.created_at.desc())
             )).scalars().all()
@@ -1747,6 +1815,7 @@ async def frame_sync(frame_id: int):
             })
 
         frame.last_sync = db.utcnow()
+        frame.sync_requested = 0            # 門鈴旗：拉取即消化
         await session.commit()
         if truncated:
             print(f"[frames] sync truncated to newest {FRAME_MAX_ALBUMS} "

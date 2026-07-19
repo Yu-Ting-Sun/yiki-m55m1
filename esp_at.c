@@ -325,6 +325,39 @@ int esp_wifi_get_ip(char *ip_out)
     return ESP_OK;
 }
 
+int esp_wifi_get_mac(char *mac_out)
+{
+    int rc;
+
+    if (!mac_out)
+        return ESP_ERR_PARAM;
+
+    mac_out[0] = '\0';
+
+    if ((rc = at_cmd("AT+CIFSR\r\n", "OK\r\n", 2000)) != ESP_OK)
+        return rc;
+
+    /* Response holds: +CIFSR:STAMAC,"aa:bb:cc:dd:ee:ff" — the board's
+     * stable hardware identity (used by /frames/register). */
+    {
+        const char *p = strstr(s_atResp, "STAMAC,\"");
+        int i = 0;
+
+        if (!p)
+            return ESP_ERR_ERROR;
+
+        p += 8;
+        while (p[i] && p[i] != '"' && i < 17)
+        {
+            mac_out[i] = p[i];
+            i++;
+        }
+        mac_out[i] = '\0';
+    }
+
+    return mac_out[0] ? ESP_OK : ESP_ERR_ERROR;
+}
+
 /*---------------------------------------------------------------------------
  * AT layer — TCP (single connection, CIPMUX=0)
  *-------------------------------------------------------------------------*/

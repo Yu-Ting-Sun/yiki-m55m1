@@ -61,14 +61,15 @@
  *     Priority: RUN_ESP_PROBE > RUN_DAY2_TESTS > RUN_DAY3_DEMO > slideshow. */
 #define RUN_DAY3_DEMO      (1)
 
-/* 1 = SD sync over Wi-Fi (the App-to-frame pipe, no card swapping): pull
- *     GET /frames/1/sync at boot and every SDSYNC_POLL_MS between photos —
- *     new/changed albums (photos + LABEL.JSON + STORY.TIM + VERSION.TXT)
- *     and faces\enroll_*.raw are downloaded straight onto the SD card.
+/* 1 = SD sync over Wi-Fi (the App-to-frame pipe, no card swapping).
+ *     Boot: register this board (ESP MAC) -> per-board frame_id + pair
+ *     code shown on the story rail; a blank card bootstraps a full sync.
+ *     Loop: every SDSYNC_CHECK_MS a ~100-byte doorbell poll — albums only
+ *     download when the App pressed 「立即同步」 (on-demand, not periodic).
  *     Fails soft: no Wi-Fi/backend -> whatever is on the card keeps playing.
  *     New enroll files still need one reboot (enrollment runs at boot). */
 #define RUN_SD_SYNC        (1)
-#define SDSYNC_POLL_MS     (60000u)
+#define SDSYNC_CHECK_MS    (10000u)
 
 /* 1 = photo-frame mode: show 0:\pictures\*.bmp on the LCD forever and skip
  *     the dual-model tests (falls through to the tests only if the slideshow
@@ -534,7 +535,7 @@ int main(void)
 #if RUN_SD_SYNC
         /* Boot sync BEFORE the library scan and photo enrollment, so albums
          * and enroll files pushed from the App are picked up this boot. */
-        if (SdSync_Run(true) > 0)
+        if (SdSync_Boot() > 0)
             printf("[MAIN] SD content updated from backend\n");
 #endif
 
@@ -684,17 +685,17 @@ int main(void)
                 if (slrc != 0) break;
 
 #if RUN_SD_SYNC
-                /* Periodic pull between photos: cheap manifest check; only
-                 * albums whose version changed actually download. On fresh
-                 * content, rescan the library so it enters the rotation. */
+                /* Doorbell between photos: a tiny /pending GET; the actual
+                 * download runs only when the App pressed 「立即同步」. On
+                 * fresh content, rescan so it enters the rotation now. */
                 {
-                    static uint32_t s_lastSyncMs = 0;
+                    static uint32_t s_lastCheckMs = 0;
                     uint32_t now = GetSystemTick_ms();
 
-                    if (now - s_lastSyncMs >= SDSYNC_POLL_MS)
+                    if (now - s_lastCheckMs >= SDSYNC_CHECK_MS)
                     {
-                        s_lastSyncMs = now;
-                        if (SdSync_Run(false) > 0)
+                        s_lastCheckMs = now;
+                        if (SdSync_Poll() > 0)
                         {
                             Slideshow_LibScan(SLIDESHOW_DIR);
                             continue;           /* show the new content now */
