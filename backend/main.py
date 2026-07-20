@@ -1498,7 +1498,45 @@ async def delete_saved_spot(trip_id: int, spot_id: int):
 # 用「路由 + 組答」兩段 llm_json（不依賴 function-calling API，proxy 一定吃）。
 
 GUIDE_WALK_M_PER_MIN = 80          # 走路速度估計（≈5 km/h）
+GUIDE_BIKE_M_PER_MIN = 250         # 騎車估計（≈15 km/h）
+GUIDE_DETOUR = 1.3                 # 直線 → 實際路程的粗略放大係數
 GUIDE_MAX_RADIUS_M = 1500
+
+# 地名 → 座標（forward geocoding）。Nominatim 使用政策：1 req/s + 自訂 UA。
+NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+GEO_UA = "yiki-app/0.1 (family trip memory PoC; q56141036@gs.ncku.edu.tw)"
+_geo_last_call = 0.0
+
+
+async def geocode_place(query: str, near: tuple[float, float] | None = None
+                        ) -> tuple[float, float, str] | None:
+    """地名查座標；near 提供時偏好附近的結果。查不到回 None。"""
+    global _geo_last_call
+    wait = 1.1 - (time.monotonic() - _geo_last_call)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _geo_last_call = time.monotonic()
+
+    params = {"q": query, "format": "jsonv2", "limit": "1",
+              "accept-language": "zh-TW"}
+    if near:
+        lat, lng = near
+        d = 0.25  # ~25km 視窗做鄰近偏好（不強制）
+        params["viewbox"] = f"{lng - d},{lat + d},{lng + d},{lat - d}"
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(NOMINATIM_SEARCH_URL, params=params,
+                                  headers={"User-Agent": GEO_UA}, timeout=10)
+            r.raise_for_status()
+            arr = r.json()
+    except Exception as e:  # noqa: BLE001
+        print(f"[guide] geocode failed for '{query}': {e}")
+        return None
+    if not arr:
+        return None
+    top = arr[0]
+    name = (top.get("name") or top.get("display_name", query).split(",")[0]).strip()
+    return float(top["lat"]), float(top["lon"]), name
 
 
 class GuideRequest(BaseModel):
@@ -1513,13 +1551,15 @@ def build_guide_router_prompt(message: str) -> str:
         f"使用者說：{message}\n\n"
         "判斷意圖並輸出 JSON：\n"
         "- nearby：找附近店家/景點（例：附近有冰店嗎、走路10分鐘有什麼好吃的）\n"
+        "- route：問怎麼去某地、去某地要多久、某地離這裡多遠"
+        "（例：從這裡去赤崁樓要多久、怎麼去火車站、林百貨多遠）\n"
         "- describe：想了解某地點的故事/介紹（例：介紹這個景點、赤崁樓的故事）\n"
         "- greeting：打招呼問候（例：你好、嗨、哈囉）\n"
         "- chat：其他閒聊\n\n"
-        '只輸出 JSON：{"intent":"nearby|describe|greeting|chat",'
+        '只輸出 JSON：{"intent":"nearby|route|describe|greeting|chat",'
         '"category":"food 或 sight 或 any 或具體分類（冰品/咖啡廳/餐廳/古蹟/景點/公園…）",'
         '"minutes":走路分鐘數（使用者有講才填，否則 10）,'
-        '"place":"describe 的地點名（沒指定就空字串＝指現在附近）",'
+        '"place":"route 的目的地 / describe 的地點名（describe 沒指定就空字串＝現在附近）",'
         '"reply":"greeting/chat 時你溫暖口語的回覆（1-2句繁中，第一人稱小憶）；'
         'nearby/describe 留空"}'
     )
@@ -1578,8 +1618,12 @@ async def guide_ask(req: GuideRequest):
     # 1) 路由：判斷意圖
     if mock:
         low = msg.lower()
+        m = re.search(r"(?:去|到|往)\s*([一-鿿A-Za-z0-9]+?)"
+                      r"(?:要|怎|多遠|有多|遠嗎|近嗎|$)", msg)
         if any(w in msg for w in ("你好", "嗨", "哈囉")) or "hi" in low:
             route = {"intent": "greeting", "reply": "你好呀～我是小憶，今天想去哪走走呢？"}
+        elif any(w in msg for w in ("要多久", "怎麼去", "多遠", "多近", "距離")) and m:
+            route = {"intent": "route", "place": m.group(1)}
         elif any(w in msg for w in ("冰", "吃", "喝", "咖啡", "附近", "分鐘")):
             route = {"intent": "nearby", "category": "food", "minutes": 10}
         elif "介紹" in msg or "故事" in msg:
@@ -1599,9 +1643,35 @@ async def guide_ask(req: GuideRequest):
         return {"reply": route.get("reply") or "你好呀～我是小憶！",
                 "action": "wave", "spots": []}
 
-    if intent in ("nearby", "describe") and (req.lat is None or req.lng is None):
+    if intent in ("nearby", "describe", "route") and (
+            req.lat is None or req.lng is None):
         return {"reply": "我需要知道你在哪裡才幫得上忙～請先開啟定位喔！",
                 "action": "think", "spots": []}
+
+    if intent == "route":
+        place = str(route.get("place") or "").strip()
+        if not place:
+            return {"reply": "你想去哪裡呀？告訴我地點名字，我幫你算算多久會到！",
+                    "action": "think", "spots": []}
+        geo = await geocode_place(place, near=(req.lat, req.lng))
+        if geo is None:
+            return {"reply": f"咦，我找不到「{place}」耶，換個說法或地標再問問看？",
+                    "action": "think", "spots": []}
+        tlat, tlng, tname = geo
+        straight = db.haversine_m(req.lat, req.lng, tlat, tlng)
+        route_m = straight * GUIDE_DETOUR
+        walk = max(1, round(route_m / GUIDE_WALK_M_PER_MIN))
+        bike = max(1, round(route_m / GUIDE_BIKE_M_PER_MIN))
+        dist_label = (f"{straight/1000:.1f} 公里" if straight >= 1000
+                      else f"{round(straight)} 公尺")
+        reply = (f"從這裡到{tname}直線大約 {dist_label}，"
+                 f"走路約 {walk} 分鐘、騎車約 {bike} 分鐘"
+                 f"（實際看路線會再多一些）。要開導航直接點下面就好！")
+        spot = {"name": tname, "lat": tlat, "lng": tlng,
+                "distance_m": round(straight, 1),
+                "category": "目的地", "description": f"走路約 {walk} 分鐘"}
+        print(f"[guide] route to {tname}: {dist_label}, walk {walk}min")
+        return {"reply": reply, "action": "point", "spots": [spot]}
 
     if intent == "nearby":
         minutes = int(route.get("minutes") or 10)
