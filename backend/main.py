@@ -1492,6 +1492,167 @@ async def delete_saved_spot(trip_id: int, spot_id: int):
         return {"deleted": spot_id}
 
 
+# ================================================================ App: guide
+# 導遊精靈「小憶」——LLM agent：判斷意圖 → 呼叫工具（附近 POI / 地點介紹）
+# → 回溫暖口語，並附一個 action 標籤讓 App 的角色做動作（揮手/指路/說話）。
+# 用「路由 + 組答」兩段 llm_json（不依賴 function-calling API，proxy 一定吃）。
+
+GUIDE_WALK_M_PER_MIN = 80          # 走路速度估計（≈5 km/h）
+GUIDE_MAX_RADIUS_M = 1500
+
+
+class GuideRequest(BaseModel):
+    message: str
+    lat: float | None = None
+    lng: float | None = None
+
+
+def build_guide_router_prompt(message: str) -> str:
+    return (
+        "你是旅遊 App「憶起」導遊精靈「小憶」的意圖判斷器。"
+        f"使用者說：{message}\n\n"
+        "判斷意圖並輸出 JSON：\n"
+        "- nearby：找附近店家/景點（例：附近有冰店嗎、走路10分鐘有什麼好吃的）\n"
+        "- describe：想了解某地點的故事/介紹（例：介紹這個景點、赤崁樓的故事）\n"
+        "- greeting：打招呼問候（例：你好、嗨、哈囉）\n"
+        "- chat：其他閒聊\n\n"
+        '只輸出 JSON：{"intent":"nearby|describe|greeting|chat",'
+        '"category":"food 或 sight 或 any 或具體分類（冰品/咖啡廳/餐廳/古蹟/景點/公園…）",'
+        '"minutes":走路分鐘數（使用者有講才填，否則 10）,'
+        '"place":"describe 的地點名（沒指定就空字串＝指現在附近）",'
+        '"reply":"greeting/chat 時你溫暖口語的回覆（1-2句繁中，第一人稱小憶）；'
+        'nearby/describe 留空"}'
+    )
+
+
+def build_guide_nearby_prompt(message: str, spots: list[dict]) -> str:
+    listing = "\n".join(
+        f"{i+1}. {s['name']}（{s['category']}）約 {int(s['distance_m'])} 公尺"
+        for i, s in enumerate(spots)
+    )
+    return (
+        "你是導遊精靈小憶，親切口語。使用者問：" + message + "\n"
+        "附近符合的地點（由近到遠）：\n" + listing + "\n\n"
+        "用 2 到 3 句繁體中文、溫暖口語推薦其中幾個，可換算步行時間"
+        f"（每分鐘約 {GUIDE_WALK_M_PER_MIN} 公尺）。只根據清單，不要編造。"
+        '只輸出 JSON：{"reply":"..."}'
+    )
+
+
+def build_guide_describe_prompt(place: str) -> str:
+    return (
+        f"你是導遊精靈小憶。使用者想了解「{place}」。"
+        "用 3 到 4 句繁體中文、溫暖口語介紹它的特色或小故事，像在地導遊。"
+        "若你不確定真實的歷史細節，就描寫可以怎麼欣賞、體驗這裡，不要編造具體史實。"
+        '只輸出 JSON：{"reply":"..."}'
+    )
+
+
+async def _guide_pool(lat: float, lng: float, radius_m: int) -> list[dict]:
+    async with httpx.AsyncClient() as client:
+        elements = await overpass_pois(
+            client, [(lat, lng)], total_budget_s=20, radius_m=radius_m)
+    return parse_overpass_elements(elements, [(lat, lng)])
+
+
+def _guide_filter(pool: list[dict], category: str, limit: int = 6) -> list[dict]:
+    if category in ("food", "sight"):
+        want_food = category == "food"
+        cands = [s for s in pool if (s["category"] in FOOD_KINDS) == want_food]
+    elif category and category not in ("any", ""):
+        cands = [s for s in pool if s["category"] == category]
+    else:
+        return balanced_pick(pool, limit)
+    cands.sort(key=lambda s: s["distance_m"])
+    return cands[:limit] or balanced_pick(pool, limit)
+
+
+@app.post("/guide/ask")
+async def guide_ask(req: GuideRequest):
+    msg = req.message.strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="說點什麼吧")
+
+    mock = os.environ.get("LLM_MOCK") == "1"
+
+    # 1) 路由：判斷意圖
+    if mock:
+        low = msg.lower()
+        if any(w in msg for w in ("你好", "嗨", "哈囉")) or "hi" in low:
+            route = {"intent": "greeting", "reply": "你好呀～我是小憶，今天想去哪走走呢？"}
+        elif any(w in msg for w in ("冰", "吃", "喝", "咖啡", "附近", "分鐘")):
+            route = {"intent": "nearby", "category": "food", "minutes": 10}
+        elif "介紹" in msg or "故事" in msg:
+            route = {"intent": "describe", "place": ""}
+        else:
+            route = {"intent": "chat", "reply": "嘿嘿，我聽著呢～想散步的話，問我附近有什麼都可以喔！"}
+    else:
+        try:
+            route = await asyncio.to_thread(llm_json, build_guide_router_prompt(msg))
+        except HTTPException:
+            route = {"intent": "chat", "reply": "小憶剛剛恍神了，再說一次好嗎？"}
+
+    intent = route.get("intent", "chat")
+
+    # 2) 依意圖執行工具 / 組答
+    if intent == "greeting":
+        return {"reply": route.get("reply") or "你好呀～我是小憶！",
+                "action": "wave", "spots": []}
+
+    if intent in ("nearby", "describe") and (req.lat is None or req.lng is None):
+        return {"reply": "我需要知道你在哪裡才幫得上忙～請先開啟定位喔！",
+                "action": "think", "spots": []}
+
+    if intent == "nearby":
+        minutes = int(route.get("minutes") or 10)
+        radius = max(200, min(minutes * GUIDE_WALK_M_PER_MIN, GUIDE_MAX_RADIUS_M))
+        try:
+            pool = await _guide_pool(req.lat, req.lng, radius)
+        except HTTPException:
+            return {"reply": "附近的地圖資料剛好塞車了，等一下再問我一次好嗎？",
+                    "action": "think", "spots": []}
+        spots = _guide_filter(pool, str(route.get("category") or "any"))
+        if not spots:
+            return {"reply": "這附近我沒找到符合的地方耶，換個條件再問問看？",
+                    "action": "think", "spots": []}
+        if mock:
+            reply = f"這附近走路一下就到的有 {spots[0]['name']}，還有 {spots[1]['name'] if len(spots) > 1 else '幾個好去處'} 喔，要不要去看看？"
+        else:
+            try:
+                data = await asyncio.to_thread(
+                    llm_json, build_guide_nearby_prompt(msg, spots))
+                reply = str(data.get("reply", "")).strip() or "我找到幾個地方，看看下面～"
+            except HTTPException:
+                reply = "我找到幾個地方，看看下面這些吧～"
+        return {"reply": reply, "action": "point", "spots": spots}
+
+    if intent == "describe":
+        place = str(route.get("place") or "").strip()
+        if not place:
+            try:
+                pool = await _guide_pool(req.lat, req.lng, 400)
+                sights = [s for s in pool if s["category"] not in FOOD_KINDS]
+                place = (sights or pool or [{"name": ""}])[0]["name"]
+            except HTTPException:
+                place = ""
+        if not place:
+            return {"reply": "這附近我一時找不到有故事的地標，你也可以直接告訴我地點名字！",
+                    "action": "think", "spots": []}
+        if mock:
+            reply = f"說到{place}呀，這裡很值得放慢腳步走走，感受一下在地的氛圍，說不定會有意外的小發現喔！"
+        else:
+            try:
+                data = await asyncio.to_thread(
+                    llm_json, build_guide_describe_prompt(place))
+                reply = str(data.get("reply", "")).strip() or f"{place}是個值得走走的好地方喔！"
+            except HTTPException:
+                reply = f"{place}是個值得走走的好地方喔！"
+        return {"reply": reply, "action": "talk", "spots": []}
+
+    # chat
+    return {"reply": route.get("reply") or "嘿嘿，我在聽～", "action": "talk", "spots": []}
+
+
 # ================================================================ App: faces
 # App 自拍註冊（隊友 Week-2 README 的「App 註冊」路線）：
 #   App 上傳自拍＋名字 → 這裡轉成板端 photo-enroll 吃的 240x240 RGB565 LE raw
