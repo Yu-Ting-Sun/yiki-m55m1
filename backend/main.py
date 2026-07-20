@@ -1539,16 +1539,41 @@ async def geocode_place(query: str, near: tuple[float, float] | None = None
     return float(top["lat"]), float(top["lon"]), name
 
 
+class GuideTurn(BaseModel):
+    role: str   # "user" | "guide"
+    text: str
+
+
 class GuideRequest(BaseModel):
     message: str
     lat: float | None = None
     lng: float | None = None
+    # 最近幾輪對話（App 帶上來，讓「第一家/那個/剛剛說的」等指代解得開）。
+    # 後端只取最後 GUIDE_HISTORY_MAX 則、每則截斷，token 有天花板。
+    history: list[GuideTurn] = []
 
 
-def build_guide_router_prompt(message: str) -> str:
+GUIDE_HISTORY_MAX = 10       # 最多 5 輪往返
+GUIDE_HISTORY_CHARS = 120    # 每則截斷
+
+
+def _format_history(history: list[GuideTurn]) -> str:
+    if not history:
+        return ""
+    lines = []
+    for t in history[-GUIDE_HISTORY_MAX:]:
+        who = "使用者" if t.role == "user" else "小憶"
+        lines.append(f"{who}：{t.text[:GUIDE_HISTORY_CHARS]}")
+    return "最近的對話（供理解指代，不是最新的問題）：\n" + "\n".join(lines) + "\n\n"
+
+
+def build_guide_router_prompt(message: str, history: list[GuideTurn]) -> str:
     return (
-        "你是旅遊 App「憶起」導遊精靈「小憶」的意圖判斷器。"
-        f"使用者說：{message}\n\n"
+        "你是旅遊 App「憶起」導遊精靈「小憶」的意圖判斷器。\n"
+        + _format_history(history)
+        + f"使用者最新說：{message}\n\n"
+        "若這句用到「它/那個/第一家/剛剛說的/那裡」等指代，"
+        "請依上面的對話判斷真正指的地點，填進 place。\n\n"
         "判斷意圖並輸出 JSON：\n"
         "- nearby：找附近店家/景點（例：附近有冰店嗎、走路10分鐘有什麼好吃的）\n"
         "- route：問怎麼去某地、去某地要多久、某地離這裡多遠"
@@ -1632,7 +1657,8 @@ async def guide_ask(req: GuideRequest):
             route = {"intent": "chat", "reply": "嘿嘿，我聽著呢～想散步的話，問我附近有什麼都可以喔！"}
     else:
         try:
-            route = await asyncio.to_thread(llm_json, build_guide_router_prompt(msg))
+            route = await asyncio.to_thread(
+                llm_json, build_guide_router_prompt(msg, req.history))
         except HTTPException:
             route = {"intent": "chat", "reply": "小憶剛剛恍神了，再說一次好嗎？"}
 
