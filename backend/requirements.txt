@@ -7,3 +7,4 @@ aiosqlite
 edge-tts
 python-multipart
 httpx
+python-dotenv

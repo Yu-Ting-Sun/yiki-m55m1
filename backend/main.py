@@ -45,6 +45,7 @@ from pathlib import Path
 
 import httpx
 import litellm  # heavy import (~10 s); pay it at startup, not on first /generate
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, Response
@@ -55,6 +56,10 @@ from sqlalchemy.orm import selectinload
 import db
 from db import Frame, GpsPoint, Photo, Trip, TripSpot
 from textimg import render_story_tim4
+
+# 從 backend/.env 載入環境變數（若存在）——必須在下面所有 os.environ.get(...)
+# 之前跑。shell 已設的變數優先（override=False），不會被 .env 蓋掉。
+load_dotenv(Path(__file__).with_name(".env"))
 
 
 @asynccontextmanager
