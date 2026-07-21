@@ -1193,6 +1193,114 @@ def parse_overpass_elements(
     return candidates
 
 
+# --- POI 供應層：Foursquare（設了 key 就用）或 Overpass（免費、預設） ---------
+# 設 FOURSQUARE_API_KEY 就走 Foursquare Places（穩定、venue 資料好）；沒設或
+# 失敗就退回 Overpass。兩者都回同一種 spot dict，分類標籤都對到 FOOD_KINDS
+# / 非 FOOD_KINDS，balanced_pick 與 App 的 isFood 判斷才一致。
+
+FOURSQUARE_API_KEY = os.environ.get("FOURSQUARE_API_KEY", "").strip()
+FSQ_SEARCH_URL = "https://places-api.foursquare.com/places/search"
+FSQ_API_VERSION = "2025-06-17"
+
+
+def fsq_category(cat_name: str) -> tuple[bool, str] | None:
+    """Foursquare 英文分類名 → (是否美食, 中文標籤)；認不得的回 None（濾掉，
+    如停車場/銀行/辦公室）。美食標籤限 FOOD_KINDS 內、景點標籤在其外。"""
+    n = cat_name.lower()
+    # 美食
+    if any(k in n for k in ("ice cream", "gelato", "frozen yogurt", "shaved ice")):
+        return True, "冰品"
+    if any(k in n for k in ("coffee", "café", "cafe", "tea", "bubble", "boba")):
+        return True, "咖啡廳"
+    if any(k in n for k in ("bakery", "pastry", "bagel", "donut", "bread")):
+        return True, "烘焙坊"
+    if any(k in n for k in ("bar", "pub", "brewery", "beer", "cocktail", "wine", "izakaya")):
+        return True, "酒吧"
+    if "market" in n and "supermarket" not in n:
+        return True, "市場"
+    if any(k in n for k in (
+            "restaurant", "food", "diner", "dining", "noodle", "bbq", "grill",
+            "steak", "pizza", "burger", "sushi", "ramen", "dumpling", "hotpot",
+            "hot pot", "buffet", "snack", "breakfast", "brunch", "seafood",
+            "dessert", "eatery", "bistro", "deli", "canteen", "joint", "curry")):
+        return True, "餐廳"
+    # 景點/地標
+    if "museum" in n:
+        return False, "博物館"
+    if any(k in n for k in ("historic", "monument", "heritage", "castle",
+                            "fort", "ruins", "memorial")):
+        return False, "古蹟"
+    if any(k in n for k in ("temple", "shrine", "church", "mosque")):
+        return False, "廟宇"
+    if any(k in n for k in ("park", "garden", "plaza", "square")):
+        return False, "公園"
+    if any(k in n for k in ("scenic", "lookout", "overlook", "viewpoint", "harbor", "pier", "beach")):
+        return False, "觀景點"
+    if any(k in n for k in ("art gallery", "gallery", "art museum", "theater", "cultural")):
+        return False, "藝文"
+    if any(k in n for k in ("landmark", "tourist", "attraction", "zoo", "aquarium")):
+        return False, "景點"
+    return None
+
+
+async def foursquare_search(lat: float, lng: float, radius_m: int,
+                            limit: int = 50) -> list[dict]:
+    """Foursquare Place Search → spot dict 清單（已濾掉非美食/景點）。"""
+    params = {
+        "ll": f"{lat},{lng}",
+        "radius": str(max(50, min(int(radius_m), 100000))),
+        "limit": str(min(limit, 50)),
+        "sort": "DISTANCE",
+    }
+    headers = {
+        "Authorization": f"Bearer {FOURSQUARE_API_KEY}",
+        "X-Places-Api-Version": FSQ_API_VERSION,
+        "accept": "application/json",
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.get(FSQ_SEARCH_URL, params=params,
+                             headers=headers, timeout=15)
+    r.raise_for_status()
+    out: list[dict] = []
+    seen: set[str] = set()
+    for p in r.json().get("results", []):
+        plat, plng = p.get("latitude"), p.get("longitude")
+        name = (p.get("name") or "").strip()
+        if plat is None or plng is None or not name or name in seen:
+            continue
+        kind = None
+        for c in p.get("categories", []):
+            kind = fsq_category(c.get("name", ""))
+            if kind:
+                break
+        if kind is None:
+            continue
+        seen.add(name)
+        out.append({
+            "name": name,
+            "lat": plat,
+            "lng": plng,
+            "distance_m": round(float(p.get("distance", 0)), 1),
+            "category": kind[1],
+            "description": "",
+        })
+    return out
+
+
+async def find_pois(lat: float, lng: float, radius_m: int,
+                    budget_s: float = 20) -> list[dict]:
+    """單點周邊 POI；有 Foursquare key 就用它，失敗或沒 key 退回 Overpass。"""
+    if FOURSQUARE_API_KEY:
+        try:
+            return await foursquare_search(lat, lng, radius_m)
+        except Exception as e:  # noqa: BLE001
+            print(f"[poi] foursquare failed ({e}); falling back to overpass")
+    async with httpx.AsyncClient() as client:
+        elements = await overpass_pois(
+            client, [(lat, lng)], total_budget_s=budget_s, radius_m=int(radius_m))
+    return parse_overpass_elements(elements, [(lat, lng)])
+
+
 async def overpass_pois(
     client: httpx.AsyncClient, points: list[tuple[float, float]],
     total_budget_s: float = 40, radius_m: int = SPOT_RADIUS_M,
@@ -1269,18 +1377,25 @@ def build_spot_lines_prompt(spots: list[dict]) -> str:
 
 async def build_spot_pool(trip_id: int, pts: list[tuple[float, float]],
                           budget_s: float = 40) -> list[dict]:
-    """查 Overpass 並解析成候選 POI 池（含分類、離路線距離），依名稱去重。
-    結果快取起來，重新推薦時重用、不再打 Overpass。
-    budget_s：Overpass 總時間上限（遊記那邊給短預算，best-effort）。"""
+    """沿路線取樣點查周邊 POI（Foursquare 或 Overpass）→ 候選池，依名稱去重、
+    距離改成到最近軌跡點。結果快取，重新推薦時重用、不再重查。"""
     pool = _SPOTS_POOL.get(trip_id)
     if pool and pool[0] == len(pts):
         return pool[1]
 
     samples = sample_route_points(pts)
-    async with httpx.AsyncClient() as client:
-        elements = await overpass_pois(client, samples, total_budget_s=budget_s)
+    merged: dict[str, dict] = {}
+    for slat, slng in samples:
+        try:
+            for s in await find_pois(slat, slng, SPOT_RADIUS_M, budget_s=budget_s):
+                merged.setdefault(s["name"], s)
+        except Exception as e:  # noqa: BLE001 — 單點失敗略過，其他點照查
+            print(f"[spots] sample ({slat:.4f},{slng:.4f}) failed: {e}")
 
-    candidates = parse_overpass_elements(elements, pts)
+    candidates = list(merged.values())
+    for s in candidates:  # 距離統一成到最近軌跡點
+        s["distance_m"] = round(
+            min(db.haversine_m(s["lat"], s["lng"], a, b) for a, b in pts), 1)
     _SPOTS_POOL[trip_id] = (len(pts), candidates)
     print(f"[spots] trip {trip_id}: pool of {len(candidates)} POIs "
           f"from {len(samples)} sample points")
@@ -1306,11 +1421,7 @@ async def _nearby_pool(
     hit = _NEARBY_POOL.get(key)
     if hit and time.monotonic() - hit[0] < NEARBY_TTL_S:
         return hit[1]
-    async with httpx.AsyncClient() as client:
-        elements = await overpass_pois(
-            client, [(lat, lng)], total_budget_s=25, radius_m=NEARBY_RADIUS_M
-        )
-    candidates = parse_overpass_elements(elements, [(lat, lng)])
+    candidates = await find_pois(lat, lng, NEARBY_RADIUS_M, budget_s=25)
     _NEARBY_POOL[key] = (time.monotonic(), candidates)
     return candidates
 
@@ -1614,10 +1725,7 @@ def build_guide_describe_prompt(place: str) -> str:
 
 
 async def _guide_pool(lat: float, lng: float, radius_m: int) -> list[dict]:
-    async with httpx.AsyncClient() as client:
-        elements = await overpass_pois(
-            client, [(lat, lng)], total_budget_s=20, radius_m=radius_m)
-    return parse_overpass_elements(elements, [(lat, lng)])
+    return await find_pois(lat, lng, radius_m, budget_s=20)
 
 
 def _guide_filter(pool: list[dict], category: str, limit: int = 6) -> list[dict]:
