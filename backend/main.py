@@ -1723,20 +1723,24 @@ def build_guide_router_prompt(message: str, history: list[GuideTurn]) -> str:
         '"keyword":"nearby 時使用者指定的「具體品項」（例：牛肉湯、豆花、拉麵、鹹粥）。'
         '只是泛稱（好吃的/美食/景點）就空字串",'
         '"minutes":走路分鐘數（使用者有講才填，否則 10）,'
-        '"place":"route 的目的地 / describe 的地點名（describe 沒指定就空字串＝現在附近）",'
+        '"place":"「地點名」：nearby 時若使用者指定某地附近（例：赤崁樓附近有什麼吃的'
+        '→ 赤崁樓）；route 的目的地；describe 的對象。沒指定＝空字串（以使用者現在位置為準）",'
         '"reply":"greeting/chat 時你溫暖口語的回覆（1-2句繁中，第一人稱小憶）；'
         'nearby/describe 留空"}'
     )
 
 
-def build_guide_nearby_prompt(message: str, spots: list[dict]) -> str:
+def build_guide_nearby_prompt(message: str, spots: list[dict],
+                              anchor: str = "") -> str:
+    where = f"「{anchor}」附近" if anchor else "使用者附近"
     listing = "\n".join(
         f"{i+1}. {s['name']}（{s['category']}）約 {int(s['distance_m'])} 公尺"
         for i, s in enumerate(spots)
     )
     return (
         "你是導遊精靈小憶，親切口語。使用者問：" + message + "\n"
-        "附近符合的地點（由近到遠）：\n" + listing + "\n\n"
+        + where + f"符合的地點（由近到遠，距離是離{anchor or '使用者'}的直線距離）：\n"
+        + listing + "\n\n"
         "用 2 到 3 句繁體中文、溫暖口語推薦其中幾個，可換算步行時間"
         f"（每分鐘約 {GUIDE_WALK_M_PER_MIN} 公尺）。只根據清單，不要編造。"
         '只輸出 JSON：{"reply":"..."}'
@@ -1806,8 +1810,10 @@ async def guide_ask(req: GuideRequest):
         return {"reply": route.get("reply") or "你好呀～我是小憶！",
                 "action": "wave", "spots": []}
 
-    if intent in ("nearby", "describe", "route") and (
-            req.lat is None or req.lng is None):
+    # nearby 若指定了地點錨點（赤崁樓附近…）可不需定位；其餘照舊要定位
+    _needs_loc = (intent in ("describe", "route")
+                  or (intent == "nearby" and not str(route.get("place") or "").strip()))
+    if _needs_loc and (req.lat is None or req.lng is None):
         return {"reply": "我需要知道你在哪裡才幫得上忙～請先開啟定位喔！",
                 "action": "think", "spots": []}
 
@@ -1840,30 +1846,43 @@ async def guide_ask(req: GuideRequest):
         minutes = int(route.get("minutes") or 10)
         radius = max(200, min(minutes * GUIDE_WALK_M_PER_MIN, GUIDE_MAX_RADIUS_M))
         keyword = str(route.get("keyword") or "").strip()
+
+        # 搜尋中心：預設是使用者位置；「赤崁樓附近有什麼」則以赤崁樓為中心
+        center_lat, center_lng, anchor = req.lat, req.lng, ""
+        place = str(route.get("place") or "").strip()
+        if place:
+            near = (req.lat, req.lng) if req.lat is not None else None
+            geo = await geocode_place(place, near=near)
+            if geo is None:
+                return {"reply": f"咦，我找不到「{place}」耶，換個地標名字再問問看？",
+                        "action": "think", "spots": []}
+            center_lat, center_lng, anchor = geo
+
         try:
             if keyword:
                 # 具體品項（牛肉湯、豆花…）：直接用文字搜尋，範圍內沒有就擴大找一次
-                spots = await _guide_pool(req.lat, req.lng, radius, query=keyword)
+                spots = await _guide_pool(center_lat, center_lng, radius, query=keyword)
                 if not spots and radius < GUIDE_MAX_RADIUS_M:
                     spots = await _guide_pool(
-                        req.lat, req.lng, GUIDE_MAX_RADIUS_M, query=keyword)
+                        center_lat, center_lng, GUIDE_MAX_RADIUS_M, query=keyword)
                 spots = sorted(spots, key=lambda s: s["distance_m"])[:6]
             else:
-                pool = await _guide_pool(req.lat, req.lng, radius)
+                pool = await _guide_pool(center_lat, center_lng, radius)
                 spots = _guide_filter(pool, str(route.get("category") or "any"))
         except HTTPException:
             return {"reply": "附近的地圖資料剛好塞車了，等一下再問我一次好嗎？",
                     "action": "think", "spots": []}
         if not spots:
             what = f"「{keyword}」" if keyword else "符合的地方"
-            return {"reply": f"這附近我沒找到{what}耶，換個說法或換樣東西再問問看？",
+            where = f"{anchor}附近" if anchor else "這附近"
+            return {"reply": f"{where}我沒找到{what}耶，換個說法或換樣東西再問問看？",
                     "action": "think", "spots": []}
         if mock:
-            reply = f"這附近走路一下就到的有 {spots[0]['name']}，還有 {spots[1]['name'] if len(spots) > 1 else '幾個好去處'} 喔，要不要去看看？"
+            reply = f"{anchor or '這'}附近走路一下就到的有 {spots[0]['name']}，還有 {spots[1]['name'] if len(spots) > 1 else '幾個好去處'} 喔，要不要去看看？"
         else:
             try:
                 data = await asyncio.to_thread(
-                    llm_json, build_guide_nearby_prompt(msg, spots))
+                    llm_json, build_guide_nearby_prompt(msg, spots, anchor))
                 reply = str(data.get("reply", "")).strip() or "我找到幾個地方，看看下面～"
             except HTTPException:
                 reply = "我找到幾個地方，看看下面這些吧～"
