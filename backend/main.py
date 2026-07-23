@@ -1685,6 +1685,8 @@ class GuideRequest(BaseModel):
     message: str
     lat: float | None = None
     lng: float | None = None
+    # App 目前配對的相框（sync_frame 工具用；沒配對就 None）
+    frame_id: int | None = None
     # 最近幾輪對話（App 帶上來，讓「第一家/那個/剛剛說的」等指代解得開）。
     # 後端只取最後 GUIDE_HISTORY_MAX 則、每則截斷，token 有天花板。
     history: list[GuideTurn] = []
@@ -1947,6 +1949,28 @@ GUIDE_TOOLS = [
             "place": {"type": "string", "description": "目的地名稱"}},
             "required": ["place"]}}},
     {"type": "function", "function": {
+        "name": "query_my_trips",
+        "description": "查使用者「自己記錄過的旅程回憶」（真實資料：日期/距離/照片數/"
+                       "參加者/有無遊記）。使用者問自己去過哪、上次旅程、走了多遠、"
+                       "跟誰去、回顧行程時用這個。",
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "回傳最近幾趟（預設 5，最多 10）"},
+            "member": {"type": "string", "description": "只看某位參加者的旅程（例：tingyu）"},
+            "keyword": {"type": "string", "description": "標題關鍵字過濾"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "get_weather",
+        "description": "查目前天氣與未來幾小時降雨機率（評估適不適合出門、要不要帶傘）。",
+        "parameters": {"type": "object", "properties": {
+            "place": {"type": "string",
+                      "description": "地點名（留空＝使用者目前位置）"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "sync_frame",
+        "description": "通知使用者家裡的智慧相框開始同步（把旅程照片與遊記下載到相框）。"
+                       "使用者說要同步相框、把回憶推到相框時用。",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
         "name": "respond",
         "description": "給使用者最終回覆。完成任務時「必須」呼叫這個工具收尾。",
         "parameters": {"type": "object", "properties": {
@@ -1956,6 +1980,105 @@ GUIDE_TOOLS = [
                                       "think=道歉/需要更多資訊"}},
             "required": ["reply", "action"]}}},
 ]
+
+# WMO weather code → 中文（Open-Meteo 用）
+_WMO = {0: "晴朗", 1: "大致晴朗", 2: "多雲時晴", 3: "陰天", 45: "起霧", 48: "霧凇",
+        51: "毛毛雨", 53: "毛毛雨", 55: "毛毛雨", 61: "小雨", 63: "下雨", 65: "大雨",
+        66: "凍雨", 67: "凍雨", 71: "小雪", 73: "下雪", 75: "大雪", 77: "霰",
+        80: "陣雨", 81: "陣雨", 82: "強陣雨", 85: "陣雪", 86: "陣雪",
+        95: "雷雨", 96: "雷雨帶冰雹", 99: "強雷雨帶冰雹"}
+
+
+async def _tool_query_my_trips(args: dict) -> dict:
+    limit = max(1, min(int(args.get("limit") or 5), 10))
+    member = str(args.get("member") or "").strip().lower()
+    keyword = str(args.get("keyword") or "").strip()
+
+    async with db.SessionLocal() as session:
+        trips = (
+            (await session.execute(
+                select(Trip).options(selectinload(Trip.photos))
+                .order_by(Trip.created_at.desc())
+            )).scalars().all()
+        )
+
+    total_m = sum(t.distance_m for t in trips)
+    rows = []
+    for t in trips:
+        members = trip_members(t)
+        if member and member not in [m.lower() for m in members]:
+            continue
+        if keyword and keyword not in (t.title or ""):
+            continue
+        when = t.start_time or t.created_at
+        local = when.replace(tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
+        rows.append({
+            "title": t.title or "未命名旅程",
+            "date": f"{local.year}-{local.month:02d}-{local.day:02d}",
+            "distance_m": int(t.distance_m),
+            "photos": len(t.photos),
+            "members": members,
+            "has_story": bool(t.story_text),
+        })
+        if len(rows) >= limit:
+            break
+    return {"total_trips": len(trips),
+            "total_km": round(total_m / 1000, 1),
+            "trips": rows}
+
+
+async def _tool_get_weather(req: GuideRequest, args: dict) -> dict:
+    place = str(args.get("place") or "").strip()
+    lat, lng, where = req.lat, req.lng, "你的位置"
+    if place:
+        geo = await geocode_place(
+            place, near=(req.lat, req.lng) if req.lat is not None else None)
+        if geo is None:
+            return {"error": f"找不到「{place}」"}
+        lat, lng, where = geo
+    if lat is None:
+        return {"error": "使用者沒有開定位，也沒指定地點"}
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={"latitude": lat, "longitude": lng,
+                        "current": "temperature_2m,apparent_temperature,"
+                                   "precipitation,weather_code",
+                        "hourly": "precipitation_probability",
+                        "forecast_hours": 6, "timezone": "auto"},
+                timeout=10)
+            r.raise_for_status()
+            d = r.json()
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"天氣服務暫時連不上（{e}）"}
+    cur = d.get("current", {})
+    probs = (d.get("hourly", {}).get("precipitation_probability") or [])[:6]
+    return {
+        "place": where,
+        "now": {
+            "weather": _WMO.get(int(cur.get("weather_code", -1)), "未知"),
+            "temp_c": cur.get("temperature_2m"),
+            "feels_c": cur.get("apparent_temperature"),
+            "precip_mm": cur.get("precipitation"),
+        },
+        "rain_prob_next_6h_percent": probs,
+    }
+
+
+async def _tool_sync_frame(req: GuideRequest) -> dict:
+    if req.frame_id is None:
+        return {"error": "使用者的 App 還沒配對相框，請 respond 引導他到「相框」頁配對"}
+    async with db.SessionLocal() as session:
+        frame = (
+            await session.execute(select(Frame).where(Frame.id == req.frame_id))
+        ).scalar_one_or_none()
+        if frame is None:
+            return {"error": "找不到這台相框，可能已被解除配對"}
+        frame.sync_requested = 1
+        await session.commit()
+    print(f"[guide] frame {req.frame_id}: sync requested via 小憶")
+    return {"ok": True, "note": "相框會在約 10 秒內開始同步照片與遊記"}
 
 
 async def _tool_search_places(req: GuideRequest, args: dict, state: dict) -> dict:
@@ -2110,6 +2233,12 @@ async def _guide_ask_agent(req: GuideRequest, msg: str) -> dict:
                 result = await _tool_search_places(req, args, state)
             elif name == "get_route":
                 result = await _tool_get_route(req, args, state)
+            elif name == "query_my_trips":
+                result = await _tool_query_my_trips(args)
+            elif name == "get_weather":
+                result = await _tool_get_weather(req, args)
+            elif name == "sync_frame":
+                result = await _tool_sync_frame(req)
             else:
                 result = {"error": f"沒有 {name} 這個工具"}
             messages.append({"role": "tool", "tool_call_id": tc.id,
