@@ -2247,6 +2247,30 @@ async def _guide_ask_agent(req: GuideRequest, msg: str) -> dict:
     raise RuntimeError("agent loop exceeded max steps")
 
 
+class SpeakRequest(BaseModel):
+    text: str
+
+
+@app.post("/guide/speak")
+async def guide_speak(req: SpeakRequest):
+    """小憶開口說話：文字 → mp3（edge-tts，與相框同一個聲音 HsiaoChen）。"""
+    text = req.text.strip()[:300]
+    if not text:
+        raise HTTPException(status_code=400, detail="empty text")
+    import edge_tts
+
+    mp3_path = AUDIO_DIR / f"speak_{uuid.uuid4().hex[:8]}.mp3"
+    try:
+        communicate = edge_tts.Communicate(text, TTS_VOICE)
+        await communicate.save(str(mp3_path))
+        data = mp3_path.read_bytes()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
+    finally:
+        mp3_path.unlink(missing_ok=True)
+    return Response(content=data, media_type="audio/mpeg")
+
+
 @app.post("/guide/ask")
 async def guide_ask(req: GuideRequest):
     msg = req.message.strip()
