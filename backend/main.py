@@ -1777,8 +1777,9 @@ def _guide_filter(pool: list[dict], category: str, limit: int = 6) -> list[dict]
     return cands[:limit] or balanced_pick(pool, limit)
 
 
-@app.post("/guide/ask")
-async def guide_ask(req: GuideRequest):
+async def _guide_ask_classic(req: GuideRequest):
+    """固定意圖分類版（router→工具→組答）。作為 agent 版的保底：
+    LLM_MOCK 模式、或 agent 迴圈出任何錯時走這裡。"""
     msg = req.message.strip()
     if not msg:
         raise HTTPException(status_code=400, detail="說點什麼吧")
@@ -1917,6 +1918,219 @@ async def guide_ask(req: GuideRequest):
 
     # chat
     return {"reply": route.get("reply") or "嘿嘿，我在聽～", "action": "talk", "spots": []}
+
+
+# --- Agent 版：LLM 自己推敲意圖、決定叫哪些工具（native function calling） ----
+# 不再把話塞進固定意圖；模型看得懂就做得到（例：「帶我去最近的牛肉湯」＝
+# 先 search_places 再 get_route，自己串）。gemma4 與 gemini 都實測支援
+# tools API。任何一步出錯 → 自動退回上面的 classic 版。
+
+GUIDE_TOOLS = [
+    {"type": "function", "function": {
+        "name": "search_places",
+        "description": "搜尋某個中心點附近的店家/景點。中心點預設是使用者目前位置；"
+                       "使用者指定某地附近時才填 place。",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string",
+                        "description": "具體品項（牛肉湯/豆花/拉麵…）。泛稱（好吃的/景點）留空"},
+            "category": {"type": "string", "enum": ["food", "sight", "any"],
+                         "description": "泛搜時的類別：food=吃的喝的, sight=景點古蹟, any=都要"},
+            "place": {"type": "string",
+                      "description": "搜尋中心的地點名（例：赤崁樓）。用使用者目前位置時留空"},
+            "minutes": {"type": "integer",
+                        "description": "走路幾分鐘內（預設 10）"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "get_route",
+        "description": "從使用者目前位置到某地點的距離與步行/騎車時間。",
+        "parameters": {"type": "object", "properties": {
+            "place": {"type": "string", "description": "目的地名稱"}},
+            "required": ["place"]}}},
+    {"type": "function", "function": {
+        "name": "respond",
+        "description": "給使用者最終回覆。完成任務時「必須」呼叫這個工具收尾。",
+        "parameters": {"type": "object", "properties": {
+            "reply": {"type": "string", "description": "2-4 句溫暖口語的繁體中文回覆"},
+            "action": {"type": "string", "enum": ["wave", "point", "talk", "think"],
+                       "description": "wave=打招呼, point=推薦了地點, talk=一般回答, "
+                                      "think=道歉/需要更多資訊"}},
+            "required": ["reply", "action"]}}},
+]
+
+
+async def _tool_search_places(req: GuideRequest, args: dict, state: dict) -> dict:
+    keyword = str(args.get("keyword") or "").strip()
+    category = str(args.get("category") or "any").strip()
+    place = str(args.get("place") or "").strip()
+    minutes = int(args.get("minutes") or 10)
+    radius = max(200, min(minutes * GUIDE_WALK_M_PER_MIN, GUIDE_MAX_RADIUS_M))
+
+    lat, lng, anchor = req.lat, req.lng, ""
+    if place:
+        near = (req.lat, req.lng) if req.lat is not None else None
+        geo = await geocode_place(place, near=near)
+        if geo is None:
+            return {"error": f"找不到地點「{place}」，可請使用者換個說法"}
+        lat, lng, anchor = geo
+    if lat is None:
+        return {"error": "使用者沒有開定位，請 respond 請他開啟定位"}
+
+    try:
+        if keyword:
+            spots = await _guide_pool(lat, lng, radius, query=keyword)
+            if not spots and radius < GUIDE_MAX_RADIUS_M:
+                spots = await _guide_pool(lat, lng, GUIDE_MAX_RADIUS_M, query=keyword)
+            spots = sorted(spots, key=lambda s: s["distance_m"])[:6]
+        else:
+            pool = await _guide_pool(lat, lng, radius)
+            spots = _guide_filter(pool, category)
+    except HTTPException:
+        return {"error": "地圖服務暫時塞車，請 respond 道歉並請使用者稍後再試"}
+
+    state["spots"] = spots
+    return {
+        "center": anchor or "使用者目前位置",
+        "results": [{
+            "name": s["name"], "category": s["category"],
+            "distance_m": int(s["distance_m"]),
+            "walk_min": max(1, round(
+                s["distance_m"] * GUIDE_DETOUR / GUIDE_WALK_M_PER_MIN)),
+        } for s in spots],
+    }
+
+
+async def _tool_get_route(req: GuideRequest, args: dict, state: dict) -> dict:
+    place = str(args.get("place") or "").strip()
+    if not place:
+        return {"error": "需要目的地名稱"}
+    if req.lat is None:
+        return {"error": "使用者沒有開定位，請 respond 請他開啟定位"}
+    geo = await geocode_place(place, near=(req.lat, req.lng))
+    if geo is None:
+        return {"error": f"找不到「{place}」"}
+    tlat, tlng, tname = geo
+    straight = db.haversine_m(req.lat, req.lng, tlat, tlng)
+    route_m = straight * GUIDE_DETOUR
+    walk = max(1, round(route_m / GUIDE_WALK_M_PER_MIN))
+    bike = max(1, round(route_m / GUIDE_BIKE_M_PER_MIN))
+    state["dest"] = {"name": tname, "lat": tlat, "lng": tlng,
+                     "distance_m": round(straight, 1), "category": "目的地",
+                     "description": f"走路約 {walk} 分鐘"}
+    return {"place": tname, "straight_m": int(straight),
+            "walk_min": walk, "bike_min": bike}
+
+
+def _llm_tools_step(messages: list[dict]):
+    """一步 agent 呼叫（帶工具）。與 llm_json 同一套路由設定。"""
+    extra = {}
+    if LLM_API_BASE:
+        extra["api_base"] = LLM_API_BASE
+    if os.environ.get("LLM_API_KEY"):
+        extra["api_key"] = os.environ["LLM_API_KEY"]
+    if LLM_REASONING_EFFORT:
+        extra["reasoning_effort"] = LLM_REASONING_EFFORT
+        extra["allowed_openai_params"] = ["reasoning_effort"]
+    resp = litellm.completion(
+        model=LLM_MODEL, messages=messages,
+        tools=GUIDE_TOOLS, tool_choice="auto",
+        temperature=0.7, timeout=40, **extra)
+    return resp.choices[0].message
+
+
+def _agent_response(reply: str, action: str, state: dict) -> dict:
+    spots = list(state.get("spots") or [])
+    dest = state.get("dest")
+    if dest:
+        # 目的地卡片（有導航按鈕）永遠保留，搜尋結果讓位
+        spots = [s for s in spots if s["name"] != dest["name"]][:5]
+        spots.append(dest)
+        return {"reply": reply, "action": action, "spots": spots}
+    return {"reply": reply, "action": action, "spots": spots[:6]}
+
+
+async def _guide_ask_agent(req: GuideRequest, msg: str) -> dict:
+    state: dict = {"spots": [], "dest": None}
+    has_loc = req.lat is not None and req.lng is not None
+    system = (
+        "你是旅遊 App「憶起」的導遊精靈「小憶」，個性溫暖、口語、講繁體中文。"
+        "你可以呼叫工具完成使用者的請求，需要幾次就叫幾次"
+        "（例：「帶我去最近的牛肉湯」先 search_places 找到店，再 get_route 算路程）。\n"
+        "規則：\n"
+        "1. 「附近／這附近」一律指使用者目前位置（search_places 的 place 留空）；"
+        "只有使用者這句自己點名地點、或明說「那附近」才帶 place。\n"
+        "2. 推薦的店名只能來自工具結果，嚴禁自己編造；查不到就誠實說。\n"
+        "3. 介紹地點的故事可用你的知識，但不確定的史實不要編，可改聊怎麼欣賞。\n"
+        f"4. 使用者{'有' if has_loc else '沒有'}提供定位。\n"
+        "5. 完成時「必須」呼叫 respond 工具收尾（打招呼用 action=wave，"
+        "推薦了地點用 point，一般回答 talk，道歉或要資訊 think）。\n"
+        "6. 有效率：同一個工具不要用一樣的參數重複呼叫；工具結果夠回答了就"
+        "立刻 respond，不要多繞。"
+    )
+    messages: list[dict] = [{"role": "system", "content": system}]
+    for t in req.history[-GUIDE_HISTORY_MAX:]:
+        messages.append({"role": "user" if t.role == "user" else "assistant",
+                         "content": t.text[:GUIDE_HISTORY_CHARS]})
+    messages.append({"role": "user", "content": msg})
+
+    for _ in range(6):                       # 最多 6 步（含收尾）
+        m = await asyncio.to_thread(_llm_tools_step, messages)
+        tool_calls = getattr(m, "tool_calls", None)
+
+        if not tool_calls:                   # 模型直接回文字：當作最終回覆
+            reply = (m.content or "").strip()
+            if reply:
+                return _agent_response(reply, "talk", state)
+            raise RuntimeError("empty agent reply")
+
+        messages.append({
+            "role": "assistant", "content": m.content or "",
+            "tool_calls": [{"id": tc.id, "type": "function",
+                            "function": {"name": tc.function.name,
+                                         "arguments": tc.function.arguments}}
+                           for tc in tool_calls],
+        })
+        for tc in tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except ValueError:
+                args = {}
+            if name == "respond":
+                reply = str(args.get("reply") or "").strip()
+                action = str(args.get("action") or "talk")
+                if action not in ("wave", "point", "talk", "think"):
+                    action = "talk"
+                if reply:
+                    print(f"[guide] agent done: action={action}, "
+                          f"spots={len(state.get('spots') or [])}, "
+                          f"dest={'yes' if state.get('dest') else 'no'}")
+                    return _agent_response(reply, action, state)
+                result: dict = {"error": "reply 不可為空，請重新 respond"}
+            elif name == "search_places":
+                result = await _tool_search_places(req, args, state)
+            elif name == "get_route":
+                result = await _tool_get_route(req, args, state)
+            else:
+                result = {"error": f"沒有 {name} 這個工具"}
+            messages.append({"role": "tool", "tool_call_id": tc.id,
+                             "content": json.dumps(result, ensure_ascii=False)})
+
+    raise RuntimeError("agent loop exceeded max steps")
+
+
+@app.post("/guide/ask")
+async def guide_ask(req: GuideRequest):
+    msg = req.message.strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="說點什麼吧")
+    if os.environ.get("LLM_MOCK") == "1":
+        return await _guide_ask_classic(req)
+    try:
+        return await _guide_ask_agent(req, msg)
+    except Exception as e:  # noqa: BLE001 — agent 出任何錯都退回 classic
+        print(f"[guide] agent failed ({type(e).__name__}: {str(e)[:150]}); "
+              f"falling back to classic router")
+        return await _guide_ask_classic(req)
 
 
 # ================================================================ App: faces
