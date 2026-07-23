@@ -1253,14 +1253,18 @@ def fsq_category(cat_name: str) -> tuple[bool, str] | None:
 
 
 async def foursquare_search(lat: float, lng: float, radius_m: int,
-                            limit: int = 50) -> list[dict]:
-    """Foursquare Place Search → spot dict 清單（已濾掉非美食/景點）。"""
+                            limit: int = 50,
+                            query: str | None = None) -> list[dict]:
+    """Foursquare Place Search → spot dict 清單（已濾掉非美食/景點）。
+    query：文字搜尋（例「牛肉湯」），Foursquare 會比對店名/類別/tips。"""
     params = {
         "ll": f"{lat},{lng}",
         "radius": str(max(50, min(int(radius_m), 100000))),
         "limit": str(min(limit, 50)),
         "sort": "DISTANCE",
     }
+    if query:
+        params["query"] = query
     headers = {
         "Authorization": f"Bearer {FOURSQUARE_API_KEY}",
         "X-Places-Api-Version": FSQ_API_VERSION,
@@ -1300,11 +1304,13 @@ POI_LAST_PROVIDER = {"name": "none"}  # 最近一次實際用到的供應商（�
 
 
 async def find_pois(lat: float, lng: float, radius_m: int,
-                    budget_s: float = 20) -> list[dict]:
-    """單點周邊 POI；有 Foursquare key 就用它，失敗或沒 key 退回 Overpass。"""
+                    budget_s: float = 20,
+                    query: str | None = None) -> list[dict]:
+    """單點周邊 POI；有 Foursquare key 就用它，失敗或沒 key 退回 Overpass。
+    query：具體品項的文字搜尋（Overpass 退路只能用名稱包含比對，best-effort）。"""
     if FOURSQUARE_API_KEY:
         try:
-            spots = await foursquare_search(lat, lng, radius_m)
+            spots = await foursquare_search(lat, lng, radius_m, query=query)
             POI_LAST_PROVIDER["name"] = "foursquare"
             return spots
         except Exception as e:  # noqa: BLE001
@@ -1313,7 +1319,10 @@ async def find_pois(lat: float, lng: float, radius_m: int,
         elements = await overpass_pois(
             client, [(lat, lng)], total_budget_s=budget_s, radius_m=int(radius_m))
     POI_LAST_PROVIDER["name"] = "overpass"
-    return parse_overpass_elements(elements, [(lat, lng)])
+    spots = parse_overpass_elements(elements, [(lat, lng)])
+    if query:
+        spots = [s for s in spots if query.lower() in s["name"].lower()]
+    return spots
 
 
 async def overpass_pois(
@@ -1711,6 +1720,8 @@ def build_guide_router_prompt(message: str, history: list[GuideTurn]) -> str:
         "- chat：其他閒聊\n\n"
         '只輸出 JSON：{"intent":"nearby|route|describe|greeting|chat",'
         '"category":"food 或 sight 或 any 或具體分類（冰品/咖啡廳/餐廳/古蹟/景點/公園…）",'
+        '"keyword":"nearby 時使用者指定的「具體品項」（例：牛肉湯、豆花、拉麵、鹹粥）。'
+        '只是泛稱（好吃的/美食/景點）就空字串",'
         '"minutes":走路分鐘數（使用者有講才填，否則 10）,'
         '"place":"route 的目的地 / describe 的地點名（describe 沒指定就空字串＝現在附近）",'
         '"reply":"greeting/chat 時你溫暖口語的回覆（1-2句繁中，第一人稱小憶）；'
@@ -1741,8 +1752,9 @@ def build_guide_describe_prompt(place: str) -> str:
     )
 
 
-async def _guide_pool(lat: float, lng: float, radius_m: int) -> list[dict]:
-    return await find_pois(lat, lng, radius_m, budget_s=20)
+async def _guide_pool(lat: float, lng: float, radius_m: int,
+                      query: str | None = None) -> list[dict]:
+    return await find_pois(lat, lng, radius_m, budget_s=20, query=query)
 
 
 def _guide_filter(pool: list[dict], category: str, limit: int = 6) -> list[dict]:
@@ -1827,14 +1839,24 @@ async def guide_ask(req: GuideRequest):
     if intent == "nearby":
         minutes = int(route.get("minutes") or 10)
         radius = max(200, min(minutes * GUIDE_WALK_M_PER_MIN, GUIDE_MAX_RADIUS_M))
+        keyword = str(route.get("keyword") or "").strip()
         try:
-            pool = await _guide_pool(req.lat, req.lng, radius)
+            if keyword:
+                # 具體品項（牛肉湯、豆花…）：直接用文字搜尋，範圍內沒有就擴大找一次
+                spots = await _guide_pool(req.lat, req.lng, radius, query=keyword)
+                if not spots and radius < GUIDE_MAX_RADIUS_M:
+                    spots = await _guide_pool(
+                        req.lat, req.lng, GUIDE_MAX_RADIUS_M, query=keyword)
+                spots = sorted(spots, key=lambda s: s["distance_m"])[:6]
+            else:
+                pool = await _guide_pool(req.lat, req.lng, radius)
+                spots = _guide_filter(pool, str(route.get("category") or "any"))
         except HTTPException:
             return {"reply": "附近的地圖資料剛好塞車了，等一下再問我一次好嗎？",
                     "action": "think", "spots": []}
-        spots = _guide_filter(pool, str(route.get("category") or "any"))
         if not spots:
-            return {"reply": "這附近我沒找到符合的地方耶，換個條件再問問看？",
+            what = f"「{keyword}」" if keyword else "符合的地方"
+            return {"reply": f"這附近我沒找到{what}耶，換個說法或換樣東西再問問看？",
                     "action": "think", "spots": []}
         if mock:
             reply = f"這附近走路一下就到的有 {spots[0]['name']}，還有 {spots[1]['name'] if len(spots) > 1 else '幾個好去處'} 喔，要不要去看看？"
