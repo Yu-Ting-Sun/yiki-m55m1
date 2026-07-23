@@ -1207,6 +1207,10 @@ FOURSQUARE_API_KEY = os.environ.get("FOURSQUARE_API_KEY", "").strip()
 FSQ_SEARCH_URL = "https://places-api.foursquare.com/places/search"
 FSQ_API_VERSION = "2025-06-17"
 
+# 啟動時印出用哪個 POI 供應商，一眼可查（logs 開頭找 [poi]）。
+print(f"[poi] provider: "
+      f"{'Foursquare (key set)' if FOURSQUARE_API_KEY else 'Overpass (no key)'}")
+
 
 def fsq_category(cat_name: str) -> tuple[bool, str] | None:
     """Foursquare 英文分類名 → (是否美食, 中文標籤)；認不得的回 None（濾掉，
@@ -1292,17 +1296,23 @@ async def foursquare_search(lat: float, lng: float, radius_m: int,
     return out
 
 
+POI_LAST_PROVIDER = {"name": "none"}  # 最近一次實際用到的供應商（觀測用）
+
+
 async def find_pois(lat: float, lng: float, radius_m: int,
                     budget_s: float = 20) -> list[dict]:
     """單點周邊 POI；有 Foursquare key 就用它，失敗或沒 key 退回 Overpass。"""
     if FOURSQUARE_API_KEY:
         try:
-            return await foursquare_search(lat, lng, radius_m)
+            spots = await foursquare_search(lat, lng, radius_m)
+            POI_LAST_PROVIDER["name"] = "foursquare"
+            return spots
         except Exception as e:  # noqa: BLE001
             print(f"[poi] foursquare failed ({e}); falling back to overpass")
     async with httpx.AsyncClient() as client:
         elements = await overpass_pois(
             client, [(lat, lng)], total_budget_s=budget_s, radius_m=int(radius_m))
+    POI_LAST_PROVIDER["name"] = "overpass"
     return parse_overpass_elements(elements, [(lat, lng)])
 
 
@@ -1467,14 +1477,16 @@ async def nearby_spots(
             return {"spots": spots, "cached": True}
 
     candidates = await _nearby_pool(key, lat, lng)
-    # refresh：從最近的候選裡隨機換一組（美食/景點仍平衡），不重打 Overpass
+    # refresh：從最近的候選裡隨機換一組（美食/景點仍平衡），不重查
     spots = balanced_pick(candidates, 10, shuffle=refresh)
     if describe:
         await _describe_spots(spots)
     _NEARBY_RESULT[key] = (time.monotonic(), spots, describe)
     print(f"[spots] nearby ({lat:.4f},{lng:.4f}): {len(spots)} POIs "
-          f"(refresh={refresh}, describe={describe})")
-    return {"spots": spots, "cached": False}
+          f"(refresh={refresh}, describe={describe}, "
+          f"provider={POI_LAST_PROVIDER['name']})")
+    return {"spots": spots, "cached": False,
+            "provider": POI_LAST_PROVIDER["name"]}
 
 
 @app.get("/trips/{trip_id}/spots")
