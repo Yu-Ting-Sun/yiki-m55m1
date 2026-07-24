@@ -1063,7 +1063,11 @@ async def trip_story_txt(trip_id: int):
 async def trip_story_tim(trip_id: int):
     """LCD 文字圖（TIM4 4-bpp）——MCU 沒中文字型，顯示遊記靠這張。"""
     trip, title, subheader = await _load_trip_story(trip_id)
-    f = MEDIA_DIR / f"t{trip_id}_{_story_hash(trip.story_text)}.tim"
+    # 快取 key 必須涵蓋「圖上渲染的全部內容」——標題/日期也在圖裡，
+    # 只 hash 內文會讓改標題後繼續吐舊圖。
+    f = MEDIA_DIR / (
+        f"t{trip_id}_{_story_hash(trip.story_text + '|' + title + '|' + subheader)}.tim"
+    )
     if not f.exists():
         tim4 = render_story_tim4(
             trip.story_text, header=title, subheader=subheader,
@@ -2564,10 +2568,10 @@ async def pair_frame(req: PairRequest):
 
 
 def _trip_version(trip: Trip) -> str:
-    """一趟旅程的同步版本號。鹽值 v2：讓既有相簿版本全部失效一次——
-    修復下載截斷驗證前已寫進卡裡的壞 JPEG（板子會整批重抓）。"""
+    """一趟旅程的同步版本號。鹽值 v3：TIM 快取 key 修正前（只 hash 內文）
+    改標題會讓舊圖以新版本號寫進卡裡——升鹽值讓板子整批重抓一次。"""
     return hashlib.md5(
-        ("v2|" + trip.story_text + "|" + trip.title + "|"
+        ("v3|" + trip.story_text + "|" + trip.title + "|"
          + ",".join(str(ph.id) for ph in trip.photos) + "|"
          + ",".join(trip_members(trip))).encode("utf-8")
     ).hexdigest()[:8]
