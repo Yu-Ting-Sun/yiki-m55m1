@@ -964,6 +964,22 @@ async def update_trip_story(trip_id: int, req: StoryUpdate):
         return {"trip_id": trip_id, "story_text": trip.story_text}
 
 
+class TitleUpdate(BaseModel):
+    title: str
+
+
+@app.put("/trips/{trip_id}/title")
+async def update_trip_title(trip_id: int, req: TitleUpdate):
+    title = req.title.strip()[:100]
+    if not title:
+        raise HTTPException(status_code=400, detail="標題不能是空的")
+    async with db.SessionLocal() as session:
+        trip = await get_trip_or_404(session, trip_id)
+        trip.title = title
+        await session.commit()
+        return {"trip_id": trip_id, "title": title}
+
+
 # --- 旅程參加者（相框 label.json 的資料來源） -------------------------------
 # 板端限制（Slideshow.c）：每相簿最多 8 人、每個 label 最多 23 bytes、
 # label.json 只解析前 512 bytes。label 需與人臉註冊（enroll_<label>.raw）一致。
@@ -2547,11 +2563,41 @@ async def pair_frame(req: PairRequest):
         return frame_json(frame, await _trip_count(session, frame.id))
 
 
+def _trip_version(trip: Trip) -> str:
+    """一趟旅程的同步版本號。鹽值 v2：讓既有相簿版本全部失效一次——
+    修復下載截斷驗證前已寫進卡裡的壞 JPEG（板子會整批重抓）。"""
+    return hashlib.md5(
+        ("v2|" + trip.story_text + "|" + trip.title + "|"
+         + ",".join(str(ph.id) for ph in trip.photos) + "|"
+         + ",".join(trip_members(trip))).encode("utf-8")
+    ).hexdigest()[:8]
+
+
 @app.get("/frames/{frame_id}")
 async def frame_status(frame_id: int):
     async with db.SessionLocal() as session:
         frame = await get_frame_or_404(session, frame_id)
-        return frame_json(frame, await _trip_count(session, frame_id))
+        trips = (
+            (await session.execute(
+                select(Trip)
+                .where(_frame_trip_filter(frame_id))
+                .options(selectinload(Trip.photos))
+                .order_by(Trip.created_at.desc())
+            )).scalars().all()
+        )
+        # 「待同步」= 版本跟上次發給板子的快照不一樣的旅程（含新旅程）。
+        with_content = [t for t in trips if t.story_text or t.photos]
+        try:
+            synced = json.loads(frame.synced_versions or "{}")
+        except ValueError:
+            synced = {}
+        pending = sum(
+            1 for t in with_content[:FRAME_MAX_ALBUMS]
+            if synced.get(f"T{t.id:04d}") != _trip_version(t)
+        )
+        data = frame_json(frame, await _trip_count(session, frame_id))
+        data["pending_count"] = pending
+        return data
 
 
 # 板端 Slideshow 的相簿上限：LIB_MAX_ALBUMS(16) 含根目錄散照的 pseudo-album，
@@ -2591,13 +2637,7 @@ async def frame_sync(frame_id: int):
                     tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
                 date_str = f"{local.year}-{local.month:02d}-{local.day:02d}"
             members = trip_members(trip)
-            # 鹽值 v2：讓既有相簿版本全部失效一次 —— 修復下載截斷驗證前
-            # 已寫進卡裡的壞 JPEG（板子會整批重抓）。
-            version = hashlib.md5(
-                ("v2|" + trip.story_text + "|" + trip.title + "|"
-                 + ",".join(str(ph.id) for ph in trip.photos) + "|"
-                 + ",".join(members)).encode("utf-8")
-            ).hexdigest()[:8]
+            version = _trip_version(trip)
             has_story = bool(trip.story_text)
             items.append({
                 "trip_id": trip.id,
@@ -2632,6 +2672,9 @@ async def frame_sync(frame_id: int):
 
         frame.last_sync = db.utcnow()
         frame.sync_requested = 0            # 門鈴旗：拉取即消化
+        # 記下這次發出去的版本快照 → /frames/{id} 算「待同步」數量用。
+        frame.synced_versions = json.dumps(
+            {it["folder"]: it["version"] for it in items})
         await session.commit()
         if truncated:
             print(f"[frames] sync truncated to newest {FRAME_MAX_ALBUMS} "

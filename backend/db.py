@@ -103,6 +103,8 @@ class Frame(Base):
     device_uid: Mapped[str | None] = mapped_column(String(32), unique=True, default=None)
     # App 按「立即同步」立旗；板子輪詢 /pending 看到才真正拉 /sync（拉完清旗）。
     sync_requested: Mapped[int] = mapped_column(Integer, default=0)
+    # 上次拉 /sync 時發給板子的 {folder: version} 快照——「待同步」計數用。
+    synced_versions: Mapped[str] = mapped_column(Text, default="{}")
 
 
 async def init_db() -> None:
@@ -123,6 +125,8 @@ async def init_db() -> None:
         await add_missing("frames", "device_uid", "device_uid VARCHAR(32)")
         await add_missing("frames", "sync_requested",
                           "sync_requested INTEGER NOT NULL DEFAULT 0")
+        await add_missing("frames", "synced_versions",
+                          "synced_versions TEXT NOT NULL DEFAULT '{}'")
 
 
 def utcnow() -> datetime:
