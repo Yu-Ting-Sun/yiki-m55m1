@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 #define HTTP_ERR_PARSE   (-10)  /* got bytes, but no valid HTTP status line */
+#define HTTP_ERR_TRUNC   (-11)  /* body shorter than Content-Length (dropped +IPD data) */
 
 /* All functions return the HTTP status code (e.g. 200) on success, or a
  * negative ESP_ERR_* / HTTP_ERR_* code. For the text variants the response

@@ -219,15 +219,22 @@ static void version_write(const char *dir, const char *ver)
 /* GET urlPath -> SD sdPath (whole file through DL_BUF). 0 on success. */
 static int dl_to_file(const char *urlPath, const char *sdPath)
 {
-    int blen = 0;
-    int st = http_get_binary(BACKEND_HOST, BACKEND_PORT, urlPath,
-                             DL_BUF, DL_CAP, &blen, SYNC_FILE_TMO);
+    int blen = 0, st = 0;
 
-    if (st != 200)
+    /* One in-place retry: dropped +IPD data now comes back as
+     * HTTP_ERR_TRUNC instead of a silently short 200. */
+    for (int attempt = 0; attempt < 2; attempt++)
     {
-        printf("[SYNC] GET %s -> %d\n", urlPath, st);
-        return (st < 0) ? st : -st;
+        blen = 0;
+        st = http_get_binary(BACKEND_HOST, BACKEND_PORT, urlPath,
+                             DL_BUF, DL_CAP, &blen, SYNC_FILE_TMO);
+        if (st == 200)
+            break;
+        printf("[SYNC] GET %s -> %d%s\n", urlPath, st,
+               attempt == 0 ? " (retrying)" : "");
     }
+    if (st != 200)
+        return (st < 0) ? st : -st;
 
     if (f_open(&s_file, sdPath, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK)
     {

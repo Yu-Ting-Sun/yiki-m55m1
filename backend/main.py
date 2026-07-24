@@ -2571,8 +2571,10 @@ async def frame_sync(frame_id: int):
                     tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
                 date_str = f"{local.year}-{local.month:02d}-{local.day:02d}"
             members = trip_members(trip)
+            # 鹽值 v2：讓既有相簿版本全部失效一次 —— 修復下載截斷驗證前
+            # 已寫進卡裡的壞 JPEG（板子會整批重抓）。
             version = hashlib.md5(
-                (trip.story_text + "|" + trip.title + "|"
+                ("v2|" + trip.story_text + "|" + trip.title + "|"
                  + ",".join(str(ph.id) for ph in trip.photos) + "|"
                  + ",".join(members)).encode("utf-8")
             ).hexdigest()[:8]

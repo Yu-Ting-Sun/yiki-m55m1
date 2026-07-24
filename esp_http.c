@@ -136,6 +136,39 @@ static const uint8_t *memfind(const uint8_t *hay, int hay_len, const char *needl
     return 0;
 }
 
+/* Value of the Content-Length header inside [hdr, hdr+hdr_len), or -1.
+ * Case-insensitive match (uvicorn sends lowercase header names). */
+static int header_content_length(const uint8_t *hdr, int hdr_len)
+{
+    static const char key[] = "content-length:";
+    const int klen = (int)sizeof(key) - 1;
+
+    for (int i = 0; i + klen <= hdr_len; i++)
+    {
+        int j = 0;
+        while (j < klen)
+        {
+            char c = (char)hdr[i + j];
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if (c != key[j]) break;
+            j++;
+        }
+        if (j < klen) continue;
+
+        int v = 0, seen = 0;
+        for (int p = i + klen; p < hdr_len; p++)
+        {
+            char c = (char)hdr[p];
+            if (c == ' ' || c == '\t') { if (seen) break; else continue; }
+            if (c < '0' || c > '9') break;
+            v = v * 10 + (c - '0');
+            seen = 1;
+        }
+        return seen ? v : -1;
+    }
+    return -1;
+}
+
 int http_get_binary(const char *host, int port, const char *path,
                     uint8_t *buf, int buf_cap, int *body_len, int timeout_ms)
 {
@@ -182,10 +215,18 @@ int http_get_binary(const char *host, int port, const char *path,
 
     int hdr_len = (int)(sep + 4 - buf);
     int blen    = raw - hdr_len;
+    if (blen < 0) blen = 0;
+
+    /* A dropped +IPD segment must FAIL, not pass as a short HTTP 200 —
+     * a truncated JPEG written to SD looks synced forever. (Parse before
+     * the memmove below destroys the header bytes.) */
+    int clen = header_content_length(buf, hdr_len);
+    if (clen >= 0 && clen != blen)
+        return HTTP_ERR_TRUNC;
 
     if (blen > 0)
         memmove(buf, buf + hdr_len, (size_t)blen);
-    *body_len = (blen > 0) ? blen : 0;
+    *body_len = blen;
 
     return status;
 }
