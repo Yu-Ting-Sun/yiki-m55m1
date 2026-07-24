@@ -453,8 +453,14 @@ static int sync_faces(const char *man, const char *end, const char *facesRoot)
             get_str(o, oEnd, "url", url, sizeof(url)) != 0)
             continue;
 
+        /* PHOTO-ENROLL renames name.raw -> name.done after enrolling. */
         snprintf(sdPath, sizeof(sdPath), "%s\\%s", dir, name);
-        snprintf(donePath, sizeof(donePath), "%s.done", sdPath);
+        snprintf(donePath, sizeof(donePath), "%s", sdPath);
+        {
+            size_t nl = strlen(donePath);
+            if (nl > 4 && strcmp(&donePath[nl - 4], ".raw") == 0)
+                memcpy(&donePath[nl - 4], ".done", 6);
+        }
         if (sd_exists(sdPath) || sd_exists(donePath))
             continue;                   /* already fetched / already enrolled */
 

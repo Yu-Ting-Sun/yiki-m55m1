@@ -49,6 +49,12 @@ git clone https://github.com/Yu-Ting-Sun/yiki-m55m1.git m55m1_dual_model_poc
 > 下載的 BSP 若 `Library/` 或上表 ThirdParty 不齊，從 NuML_Studio 範本補）。
 > Keil 需安裝 M55M1 DFP（device `M55M1H2LJAE`）與 Nu-Link 驅動。
 
+> ⚠️ **必改 BSP 設定**：`ThirdParty\FatFs\source\ffconf.h` 把 `FF_USE_LFN`
+> 從 `0` 改成 `2`（長檔名支援）。本專案的 `label.json`、`embeddings.txt`、
+> `enroll_<名字>.raw` 都超過 8.3 短檔名，LFN=0 時 FatFS 會直接回
+> `FR_INVALID_NAME` —— 症狀是相簿過濾失效、臉譜同步/註冊全部靜默失敗。
+> 此檔在 BSP 內、不在本 repo，每台開發機都要各改一次。
+
 ## 快速開始
 
 ### 1. 韌體設定檔
