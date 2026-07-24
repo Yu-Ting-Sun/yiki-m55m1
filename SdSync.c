@@ -75,7 +75,11 @@ static const char *str_skip(const char *p, const char *end)
     return NULL;
 }
 
-/* Find `"key"` inside [obj, end); return the char after the closing quote. */
+/* Find `"key"` used as an OBJECT KEY inside [obj, end); returns the char
+ * after the closing quote. The next non-space char must be ':' — otherwise
+ * a string VALUE that equals a key name hijacks the lookup (real case:
+ * `"faces_root":"faces"` made the "faces" array search land on the trips
+ * array, so face enrollment files never synced). */
 static const char *find_key(const char *obj, const char *end, const char *key)
 {
     char pat[32];
@@ -84,8 +88,14 @@ static const char *find_key(const char *obj, const char *end, const char *key)
     if (n <= 0 || n >= (int)sizeof(pat))
         return NULL;
     for (const char *p = obj; p + n <= end; p++)
-        if (memcmp(p, pat, (size_t)n) == 0)
+    {
+        if (memcmp(p, pat, (size_t)n) != 0)
+            continue;
+        const char *q = p + n;
+        while (q < end && *q == ' ') q++;
+        if (q < end && *q == ':')
             return p + n;
+    }
     return NULL;
 }
 
