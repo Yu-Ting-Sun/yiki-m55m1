@@ -596,6 +596,26 @@ async def upload_photo(
         return {"photo_id": photo.id, "url": f"/photos/{photo.id}"}
 
 
+@app.delete("/photos/{photo_id}")
+async def delete_photo(photo_id: int):
+    """刪掉一張旅程照片：DB 紀錄 + 磁碟原檔 + 板子縮圖快取。
+    旅程 version 含照片 id 清單，刪除後版本改變 → 相框下次同步自動更新。"""
+    async with db.SessionLocal() as session:
+        photo = (
+            await session.execute(select(Photo).where(Photo.id == photo_id))
+        ).scalar_one_or_none()
+        if photo is None:
+            raise HTTPException(status_code=404, detail=f"unknown photo_id {photo_id}")
+        fname = photo.filename
+        await session.delete(photo)
+        await session.commit()
+    (PHOTO_DIR / fname).unlink(missing_ok=True)
+    for cache in PHOTO_DIR.glob(f"board_{photo_id}_*.jpg"):
+        cache.unlink(missing_ok=True)
+    print(f"[photos] deleted photo {photo_id} ({fname})")
+    return {"deleted": True}
+
+
 @app.get("/photos/{photo_id}")
 async def get_photo(photo_id: int):
     async with db.SessionLocal() as session:
