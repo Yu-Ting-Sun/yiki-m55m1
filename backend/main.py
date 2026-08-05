@@ -97,6 +97,10 @@ AUDIO_DIR = Path(__file__).parent / "audio_cache"
 AUDIO_DIR.mkdir(exist_ok=True)
 
 TTS_VOICE = "zh-TW-HsiaoChenNeural"
+# 小憶的聲線微調(使用者選定):音高 +20Hz 更年輕、語速 +10% 更有精神。
+# 影片旁白、App 語音、遊記朗讀三處共用,保持角色一致。
+TTS_RATE = "+10%"
+TTS_PITCH = "+20Hz"
 
 # --- LLM routing ---------------------------------------------------------
 # litellm needs a provider prefix to know which protocol to speak; a bare
@@ -268,7 +272,8 @@ async def tts_to_wav(text: str, wav_path: Path):
 
     mp3_path = wav_path.with_suffix(".mp3")
     try:
-        communicate = edge_tts.Communicate(text, TTS_VOICE)
+        communicate = edge_tts.Communicate(
+            text, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
         await communicate.save(str(mp3_path))
 
         proc = await asyncio.create_subprocess_exec(
@@ -2301,7 +2306,8 @@ async def guide_speak(req: SpeakRequest):
 
     mp3_path = AUDIO_DIR / f"speak_{uuid.uuid4().hex[:8]}.mp3"
     try:
-        communicate = edge_tts.Communicate(text, TTS_VOICE)
+        communicate = edge_tts.Communicate(
+            text, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
         await communicate.save(str(mp3_path))
         data = mp3_path.read_bytes()
     except Exception as e:  # noqa: BLE001
