@@ -96,7 +96,7 @@
  *     hold window, but nothing is drawn — recognition works silently in the
  *     background and the frame stays a clean photo frame.
  *     Only meaningful when RUN_CAMERA_PREVIEW=1. */
-#define SHOW_CAMERA_PREVIEW (0)
+#define SHOW_CAMERA_PREVIEW (1)   /* 驗證期間開著看鏡頭;拍片前改回 0 */
 
 /* 1 = Phase-3: run face detection (compiled-in yolo-fastest_192_face +
  *     DetectorPostProcessing) on each captured frame and draw the face boxes
