@@ -30,8 +30,13 @@
 #define OUT_IDX_PRESENCE     (2)
 #define OUT_IDX_SCREEN       (3)
 
-/* A hand is only considered when the model is at least this sure. */
-#define PRESENCE_THRESHOLD   (0.6f)
+/* A hand is only considered when the model is at least this sure (the BSP
+ * sample uses 0.5). */
+#define PRESENCE_THRESHOLD   (0.5f)
+
+/* 1 = throttled UART diagnostics: a heartbeat proving the model runs, plus
+ *     the rule evaluation whenever a hand is seen. Turn off for filming. */
+#define GESTURE_LIKE_LOG     (1)
 
 /* Hand must be reasonably close to the camera: wrist-to-middle-MCP distance
  * in model-input pixels (224x224). Rejects tiny far-away false hands. */
@@ -151,7 +156,18 @@ extern "C" int GestureLike_Run(const uint16_t *frameRGB565, int w, int h)
         return -2;
     }
 
-    if (dequant1(s_outPres, 0) < PRESENCE_THRESHOLD)
+    float presence = dequant1(s_outPres, 0);
+
+#if GESTURE_LIKE_LOG
+    /* Heartbeat: proves the pipeline runs even when no hand is around. */
+    static uint32_t s_calls = 0;
+    s_calls++;
+    if ((s_calls & 63) == 1)            /* every ~64 frames */
+        printf("[GESTURE] alive (call %u, presence %.2f)\n",
+               (unsigned)s_calls, presence);
+#endif
+
+    if (presence < PRESENCE_THRESHOLD)
         return 0;                       /* no hand in frame */
 
     /* 21 x (x, y, z) in model-input pixel coordinates (224x224 space). */
@@ -162,7 +178,13 @@ extern "C" int GestureLike_Run(const uint16_t *frameRGB565, int w, int h)
     /* Reject tiny/far hands: span = wrist(0) .. middle MCP(9). */
     float span2 = d2(lm, 0, 9);
     if (span2 < MIN_HAND_SPAN_PX * MIN_HAND_SPAN_PX)
+    {
+#if GESTURE_LIKE_LOG
+        printf("[GESTURE] hand seen (p=%.2f) but too small/far (span %.0f px)\n",
+               presence, sqrtf(span2));
+#endif
         return 0;
+    }
     float span = sqrtf(span2);
 
     /* Thumb extended upward (screen y grows downward):
@@ -178,9 +200,20 @@ extern "C" int GestureLike_Run(const uint16_t *frameRGB565, int w, int h)
     static const uint8_t tips[4] = { 8, 12, 16, 20 };
     static const uint8_t pips[4] = { 6, 10, 14, 18 };
     bool curled = true;
+    int  nCurled = 0;
     for (int f = 0; f < 4; f++)
-        if (d2(lm, tips[f], 0) >= d2(lm, pips[f], 0))
+    {
+        if (d2(lm, tips[f], 0) < d2(lm, pips[f], 0))
+            nCurled++;
+        else
             curled = false;
+    }
+
+#if GESTURE_LIKE_LOG
+    printf("[GESTURE] hand p=%.2f span=%.0f thumbUp=%d (rise %.0f/%.0f) "
+           "curled=%d/4\n", presence, span, thumbUp ? 1 : 0,
+           wristY - thumbTipY, 0.55f * span, nCurled);
+#endif
 
     return (thumbUp && curled) ? 1 : 0;
 }
