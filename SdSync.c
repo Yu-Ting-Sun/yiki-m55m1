@@ -447,6 +447,84 @@ static int sync_trip(const char *obj, const char *objEnd,
     return 1;
 }
 
+/* Delete every file in a flat album folder, then the folder itself.
+ * Re-opens the directory for each delete: FatFS f_readdir must never walk
+ * a directory that is being emptied underneath it. */
+static int remove_album_dir(const char *dirPath)
+{
+    DIR     dj;
+    FILINFO fno;
+    char    p[128];
+
+    for (;;)
+    {
+        if (f_opendir(&dj, dirPath) != FR_OK)
+            return -1;
+        FRESULT fr = f_readdir(&dj, &fno);
+        f_closedir(&dj);
+        if (fr != FR_OK)
+            return -1;
+        if (!fno.fname[0])
+            break;                      /* emptied — remove the dir itself */
+        snprintf(p, sizeof(p), "%s\\%s", dirPath, fno.fname);
+        if (f_unlink(p) != FR_OK)
+            return -1;                  /* unexpected nested dir: keep album */
+    }
+    return (f_unlink(dirPath) == FR_OK) ? 0 : -1;
+}
+
+/* Remove album folders the manifest no longer lists (trip deleted in the
+ * App). Only names matching the album pattern (T + digits) are considered —
+ * anything else on the card is never touched. Returns albums removed. */
+static int prune_albums(const char *sdRoot, char kept[][16], int nKept)
+{
+    static char stale[16][16];
+    char dirPath[32], sub[64];
+    int  nStale = 0, removed = 0;
+    DIR     dj;
+    FILINFO fno;
+
+    snprintf(dirPath, sizeof(dirPath), "0:\\%s", sdRoot);
+    if (f_opendir(&dj, dirPath) != FR_OK)
+        return 0;
+
+    /* Collect first, delete after closedir — removing entries would disturb
+     * the very directory f_readdir is walking. */
+    while (nStale < 16 && f_readdir(&dj, &fno) == FR_OK && fno.fname[0])
+    {
+        if (!(fno.fattrib & AM_DIR) || fno.fname[0] != 'T')
+            continue;
+        size_t n = strlen(fno.fname);
+        if (n < 2 || n >= sizeof(stale[0]))
+            continue;
+        bool isAlbum = true;
+        for (size_t i = 1; i < n; i++)
+            if (fno.fname[i] < '0' || fno.fname[i] > '9')
+                isAlbum = false;
+        if (!isAlbum)
+            continue;
+        bool keep = false;
+        for (int i = 0; i < nKept; i++)
+            if (strcmp(kept[i], fno.fname) == 0) { keep = true; break; }
+        if (!keep)
+            strcpy(stale[nStale++], fno.fname);
+    }
+    f_closedir(&dj);
+
+    for (int i = 0; i < nStale; i++)
+    {
+        snprintf(sub, sizeof(sub), "%s\\%s", dirPath, stale[i]);
+        if (remove_album_dir(sub) == 0)
+        {
+            printf("[SYNC] album %s removed (trip deleted in app)\n", stale[i]);
+            removed++;
+        }
+        else
+            printf("[SYNC] album %s: removal failed\n", stale[i]);
+    }
+    return removed;
+}
+
 /* Download enrollment raws we have never seen (neither .raw nor .raw.done
  * on the card). Returns the number of new files. */
 static int sync_faces(const char *man, const char *end, const char *facesRoot)
@@ -522,14 +600,27 @@ int SdSync_Run(bool verbose)
     f_mkdir(rootDir);
 
     int changed = 0;
+    static char kept[16][16];           /* manifest folders (backend caps 15) */
+    int  nKept = 0;
     const char *aEnd, *oEnd;
     const char *a = find_array(man, end, "trips", &aEnd);
     if (a)
     {
         for (const char *o = next_obj(a, aEnd, &oEnd); o;
              o = next_obj(oEnd, aEnd, &oEnd))
+        {
+            if (nKept < 16 &&
+                get_str(o, oEnd, "folder", kept[nKept], sizeof(kept[0])) == 0)
+                nKept++;
             changed += sync_trip(o, oEnd, sdRoot, verbose);
+        }
     }
+
+    /* Albums the backend no longer lists = trips deleted in the App.
+     * nKept>0 guard: an empty manifest must never wipe the card, and a
+     * frame with zero albums would end the slideshow loop. */
+    if (nKept > 0)
+        changed += prune_albums(sdRoot, kept, nKept);
 
     int newFaces = sync_faces(man, end, facesRoot);
     if (newFaces > 0)

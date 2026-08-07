@@ -2595,16 +2595,22 @@ async def frame_status(frame_id: int):
                 .order_by(Trip.created_at.desc())
             )).scalars().all()
         )
-        # 「待同步」= 版本跟上次發給板子的快照不一樣的旅程（含新旅程）。
+        # 「待同步」= 版本跟上次發給板子的快照不一樣的旅程（含新旅程），
+        # 加上快照裡有、現在已不存在的旅程（App 刪除 → 板子要撤下相簿）。
         with_content = [t for t in trips if t.story_text or t.photos]
         try:
             synced = json.loads(frame.synced_versions or "{}")
         except ValueError:
             synced = {}
+        current = {
+            f"T{t.id:04d}": _trip_version(t)
+            for t in with_content[:FRAME_MAX_ALBUMS]
+        }
         pending = sum(
-            1 for t in with_content[:FRAME_MAX_ALBUMS]
-            if synced.get(f"T{t.id:04d}") != _trip_version(t)
+            1 for folder, ver in current.items()
+            if synced.get(folder) != ver
         )
+        pending += sum(1 for folder in synced if folder not in current)
         data = frame_json(frame, await _trip_count(session, frame_id))
         data["pending_count"] = pending
         return data
