@@ -107,6 +107,21 @@ class Frame(Base):
     synced_versions: Mapped[str] = mapped_column(Text, default="{}")
 
 
+class LikeEvent(Base):
+    """板子上的手勢按讚：長輩對相框比讚 → 板端 POST /frames/{id}/like。
+    App 用 GET /frames/{id}/likes?after=<id> 輪詢新事件並跳通知。"""
+
+    __tablename__ = "like_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    frame_id: Mapped[int] = mapped_column(Integer, index=True)
+    trip_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    photo_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    # 板端人臉辨識出的 label（"" = 沒認出是哪位家人）
+    user_label: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

@@ -23,12 +23,10 @@
 #include "RecognitionResult.hpp"
 #include "Labels.hpp"
 
-/* Embedding model: SD file -> HyperRAM. DAY3 never loads the FACE/GESTURE SD
- * models, so the 6 MB region 0x82100000..0x82700000 (before SLIDESHOW_FB) is
- * free; face_mobilenet.tflite is ~3.17 MB and fits with room. */
+/* Embedding model: SD file -> HyperRAM. Address/size come from the DAY-3
+ * demo HyperRAM plan in MemoryLayout.h (EMBED_MODEL_ADDR @ 0x82080000,
+ * 3.25 MB slot — face_mobilenet.tflite is ~3.17 MB). */
 #define EMBED_MODEL_FILE   "0:\\face_mobilenet.tflite"
-#define EMBED_MODEL_ADDR   (FACE_MODEL_ADDR)          /* 0x82100000 */
-#define EMBED_MODEL_MAXSZ  (0x00400000UL)             /* 4 MB bound (< SLIDESHOW_FB) */
 
 /* Sample uses 460 KB; 512 KB gives headroom. Tail may spill into the HyperRAM
  * front guard (safe, slower) — the embedding runs once per detection, not per

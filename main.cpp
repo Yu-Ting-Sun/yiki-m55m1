@@ -35,6 +35,7 @@
 #include "Camera.h"
 #include "FaceDetect.hpp"
 #include "FaceRecog.hpp"
+#include "GestureLike.hpp"
 #include "esp_probe.h"
 #include "day2_test.h"
 #include "day3_demo.h"
@@ -128,6 +129,17 @@
  *     the SD card — no reflash. Needs RUN_FACE_RECOG=1, RUN_FACE_ENROLL=0. */
 #define RUN_PHOTO_ENROLL   (1)
 #define PHOTO_ENROLL_MAX   (8)   /* max photos enrolled per boot */
+
+/* 1 = 手勢按讚: run the MediaPipe hand-landmark model on each captured frame
+ *     (model + arena in HyperRAM, see MemoryLayout.h demo plan) and detect a
+ *     thumbs-up geometrically. A confirmed like is POSTed to the backend
+ *     (SdSync_PostLike) with the album/photo on screen + recognised user.
+ *     Needs RUN_CAMERA_PREVIEW + RUN_FACE_DETECT (init lives with the face
+ *     pipeline) and 0:\hand_landmark.tflite on the SD card. Init failure is
+ *     non-fatal (frame runs without the like feature). */
+#define RUN_GESTURE_LIKE   (1)
+#define LIKE_CONFIRM_HITS  (3)      /* consecutive thumbs-up frames to confirm */
+#define LIKE_COOLDOWN_MS   (10000)  /* one gesture = one like */
 
 /* Phase-5: live album filter. Single-frame cosine dips below the threshold
  * (green/red flicker), so the verdict is debounced before it drives the
@@ -467,9 +479,11 @@ static bool test_alternating(void)
  * captured camera frame with the recognised label, or NULL when nobody was
  * recognised this frame (no face, unknown face, or recog unavailable).
  *--------------------------------------------------------------------------*/
+static char s_filterUser[32] = "";   /* active filter, "" = play all
+                                        (also names the liker, Phase-6) */
+
 static void SlideFilter_Update(const char *label)
 {
-    static char     curUser[32]  = "";   /* active filter, "" = play all  */
     static char     candUser[32] = "";
     static int      candHits     = 0;
     static uint32_t lastSeenMs   = 0;
@@ -488,17 +502,17 @@ static void SlideFilter_Update(const char *label)
             candHits++;
 
         if (candHits >= FILTER_SWITCH_HITS &&
-            strncmp(candUser, curUser, sizeof(curUser)) != 0)
+            strncmp(candUser, s_filterUser, sizeof(s_filterUser)) != 0)
         {
-            strcpy(curUser, candUser);
-            int n = Slideshow_SetFilter(curUser);
-            printf("[FILTER] -> '%s' (%d album(s))\n", curUser, n);
+            strcpy(s_filterUser, candUser);
+            int n = Slideshow_SetFilter(s_filterUser);
+            printf("[FILTER] -> '%s' (%d album(s))\n", s_filterUser, n);
         }
     }
-    else if (curUser[0] != '\0' &&
+    else if (s_filterUser[0] != '\0' &&
              (GetSystemTick_ms() - lastSeenMs) > FILTER_CLEAR_MS)
     {
-        curUser[0]  = '\0';
+        s_filterUser[0] = '\0';
         candUser[0] = '\0';
         candHits    = 0;
         Slideshow_SetFilter(NULL);
@@ -507,6 +521,49 @@ static void SlideFilter_Update(const char *label)
     }
 }
 #endif /* RUN_FACE_RECOG && !RUN_FACE_ENROLL */
+
+#if RUN_GESTURE_LIKE
+/*----------------------------------------------------------------------------
+ * Phase-6: debounced thumbs-up -> one like report to the backend.
+ * LIKE_CONFIRM_HITS consecutive gesture frames confirm (kills single-frame
+ * false positives); then LIKE_COOLDOWN_MS of silence so one held gesture
+ * produces exactly one like.
+ *--------------------------------------------------------------------------*/
+static void LikeGesture_Update(int seen)
+{
+    static int      hits       = 0;
+    static uint32_t lastFireMs = 0;
+
+    if (seen <= 0)
+    {
+        hits = 0;
+        return;
+    }
+
+    uint32_t now = GetSystemTick_ms();
+    if (lastFireMs != 0 && (now - lastFireMs) < LIKE_COOLDOWN_MS)
+        return;                          /* cooling down */
+    if (++hits < LIKE_CONFIRM_HITS)
+        return;
+
+    hits       = 0;
+    lastFireMs = now;
+
+    char folder[64], photo[64];
+    Slideshow_GetCurrent(folder, sizeof(folder), photo, sizeof(photo));
+
+#if RUN_FACE_RECOG && !RUN_FACE_ENROLL
+    const char *user = s_filterUser;
+#else
+    const char *user = "";
+#endif
+
+    printf("[LIKE] thumbs-up confirmed: %s/%s by '%s'\n",
+           folder, photo, user[0] ? user : "(unknown)");
+    StoryUI_ShowStatus("Like sent <3");
+    SdSync_PostLike(folder, photo, user);
+}
+#endif /* RUN_GESTURE_LIKE */
 
 /*----------------------------------------------------------------------------
  * main
@@ -570,26 +627,64 @@ int main(void)
 #if RUN_FACE_RECOG
             bool frOk = fdOk && (FaceRecog_Init() == 0);
 #endif
+#if RUN_GESTURE_LIKE
+            /* Hand-landmark model + arena live at fixed HyperRAM addresses
+             * (MemoryLayout.h demo plan). The linker knows nothing about
+             * them, so first verify its SRAM01_HYPERRAM spill still ends
+             * below the shrunken front guard. */
+            bool glOk = false;
+            {
+                extern char Image$$SRAM01_HYPERRAM$$ZI$$Limit[];
+                uint32_t spillEnd =
+                    (uint32_t)(uintptr_t)Image$$SRAM01_HYPERRAM$$ZI$$Limit;
+
+                if (spillEnd > DEMO_GUARD_END)
+                    printf_err("[GESTURE] arena spill 0x%08X exceeds guard "
+                               "0x%08X - like feature disabled\n",
+                               (unsigned)spillEnd, (unsigned)DEMO_GUARD_END);
+                else
+                    glOk = camOk && (GestureLike_Init() == 0);
+            }
+#endif
 #if RUN_FACE_ENROLL
             int  enrollSeen = 0;
 #endif
             /* Single combined arena MPU setup (cacheable WTRA): the BSP
              * configures all app MPU regions in ONE InitPreDefMPURegion call,
              * so both arenas are set together here rather than per module. */
-            if (fdOk)
+            if (fdOk
+#if RUN_GESTURE_LIKE
+                || glOk
+#endif
+               )
             {
-                ARM_MPU_Region_t rg[2];
+                ARM_MPU_Region_t rg[3];
                 uint32_t nrg = 0;
                 void    *aBase; uint32_t aSize;
 
-                FaceDetect_GetArena(&aBase, &aSize);
-                rg[nrg].RBAR = ARM_MPU_RBAR((unsigned int)aBase, ARM_MPU_SH_NON, 0, 1, 1);
-                rg[nrg].RLAR = ARM_MPU_RLAR((unsigned int)aBase + aSize - 1, eMPU_ATTR_CACHEABLE_WTRA);
-                nrg++;
-#if RUN_FACE_RECOG
-                if (frOk)
+                if (fdOk)
                 {
-                    FaceRecog_GetArena(&aBase, &aSize);
+                    FaceDetect_GetArena(&aBase, &aSize);
+                    rg[nrg].RBAR = ARM_MPU_RBAR((unsigned int)aBase, ARM_MPU_SH_NON, 0, 1, 1);
+                    rg[nrg].RLAR = ARM_MPU_RLAR((unsigned int)aBase + aSize - 1, eMPU_ATTR_CACHEABLE_WTRA);
+                    nrg++;
+#if RUN_FACE_RECOG
+                    if (frOk)
+                    {
+                        FaceRecog_GetArena(&aBase, &aSize);
+                        rg[nrg].RBAR = ARM_MPU_RBAR((unsigned int)aBase, ARM_MPU_SH_NON, 0, 1, 1);
+                        rg[nrg].RLAR = ARM_MPU_RLAR((unsigned int)aBase + aSize - 1, eMPU_ATTR_CACHEABLE_WTRA);
+                        nrg++;
+                    }
+#endif
+                }
+#if RUN_GESTURE_LIKE
+                /* HyperRAM arena gets the same WTRA policy the Day-1 spilled
+                 * arena ran with (write-through so the NPU sees CPU-written
+                 * inputs; the ethosu cache hooks handle the way back). */
+                if (glOk)
+                {
+                    GestureLike_GetArena(&aBase, &aSize);
                     rg[nrg].RBAR = ARM_MPU_RBAR((unsigned int)aBase, ARM_MPU_SH_NON, 0, 1, 1);
                     rg[nrg].RLAR = ARM_MPU_RLAR((unsigned int)aBase + aSize - 1, eMPU_ATTR_CACHEABLE_WTRA);
                     nrg++;
@@ -731,6 +826,13 @@ int main(void)
                         }
 
                         uint16_t *frame = (uint16_t *)Camera_GetFrame();
+
+#if RUN_GESTURE_LIKE
+                        /* Gesture first: the frame is still clean here (face
+                         * boxes are drawn into it by FaceDetect_Run below). */
+                        if (glOk)
+                            LikeGesture_Update(GestureLike_Run(frame, CAM_W, CAM_H));
+#endif
 
 #if RUN_FACE_DETECT
 #if RUN_FACE_RECOG && !RUN_FACE_ENROLL

@@ -54,7 +54,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 
 import db
-from db import Frame, GpsPoint, Photo, Trip, TripSpot
+from db import Frame, GpsPoint, LikeEvent, Photo, Trip, TripSpot
 from textimg import render_story_tim4
 
 # 從 backend/.env 載入環境變數（若存在）——必須在下面所有 os.environ.get(...)
@@ -2705,6 +2705,71 @@ async def frame_sync(frame_id: int):
             "count": len(items),
             "truncated": truncated,
         }
+
+
+# ---------------------------------------------------------------------------
+# 手勢按讚：板子看到長輩對相框比讚 → POST；App 輪詢新事件跳通知。
+# ---------------------------------------------------------------------------
+
+class LikeIn(BaseModel):
+    folder: str = ""     # 相框當下播的相簿，例 "T0006"（"" = 根目錄散照）
+    photo: str = ""      # 當下照片檔名，例 "P0012.JPG"（"" = 純遊記畫面）
+    user: str = ""       # 人臉辨識 label（"" = 沒認出）
+
+
+@app.post("/frames/{frame_id}/like")
+async def frame_like(frame_id: int, body: LikeIn):
+    trip_id = photo_id = None
+    m = re.fullmatch(r"T(\d{1,8})", body.folder.strip())
+    if m:
+        trip_id = int(m.group(1))
+    m = re.fullmatch(r"P(\d{1,8})\.JPG", body.photo.strip(), re.IGNORECASE)
+    if m:
+        photo_id = int(m.group(1))
+
+    async with db.SessionLocal() as session:
+        await get_frame_or_404(session, frame_id)
+        ev = LikeEvent(
+            frame_id=frame_id,
+            trip_id=trip_id,
+            photo_id=photo_id,
+            user_label=body.user.strip()[:64],
+        )
+        session.add(ev)
+        await session.commit()
+        print(f"[like] frame {frame_id}: '{body.user or '?'}' liked "
+              f"{body.folder or '-'}/{body.photo or '-'}")
+        return {"ok": True, "like_id": ev.id}
+
+
+@app.get("/frames/{frame_id}/likes")
+async def frame_likes(frame_id: int, after: int = 0, limit: int = 20):
+    """App 輪詢用：回傳 id > after 的按讚事件（舊到新）。"""
+    async with db.SessionLocal() as session:
+        rows = (
+            (await session.execute(
+                select(LikeEvent)
+                .where(LikeEvent.frame_id == frame_id, LikeEvent.id > after)
+                .order_by(LikeEvent.id.asc())
+                .limit(max(1, min(limit, 50)))
+            )).scalars().all()
+        )
+        likes = []
+        for ev in rows:
+            title = None
+            if ev.trip_id is not None:
+                trip = await session.get(Trip, ev.trip_id)
+                title = (trip.title or "未命名旅程") if trip else None
+            likes.append({
+                "id": ev.id,
+                "trip_id": ev.trip_id,
+                "photo_id": ev.photo_id,
+                "trip_title": title,
+                "user": ev.user_label,
+                "created_at": db.iso_z(ev.created_at),
+            })
+        return {"likes": likes,
+                "last_id": likes[-1]["id"] if likes else after}
 
 
 if __name__ == "__main__":

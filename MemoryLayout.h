@@ -124,6 +124,38 @@ typedef struct
 #define SLIDESHOW_FB_ADDR      (GESTURE_MODEL_ADDR + MODEL_SLOT_SIZE)   /* 0x82700000 */
 #define SLIDESHOW_FB_SIZE      (0x00100000UL)                           /* 1 MB spare */
 
+/* ----------------------------------------------------------------------------
+ * DAY-3 demo HyperRAM plan (the FACE/GESTURE slots above are Day-1-test-only;
+ * the demo build loads DIFFERENT models and packs HyperRAM tighter):
+ *
+ *   0x82000000  front guard: linker arena spill (~180 KB today)      512 KB
+ *   0x82080000  face_mobilenet.tflite (embedding, ~3.17 MB)         3.25 MB
+ *   0x823C0000  hand_landmark.tflite (gesture-like, 2.17 MB)        2.25 MB
+ *   0x82600000  hand-landmark tensor arena (NPU-reachable, ~5x
+ *               slower than SRAM01 — fine, runs between photos)        1 MB
+ *   0x82700000  slideshow decode / sync download buffer (above)        1 MB
+ *                                                             total    8 MB
+ *
+ * The front guard shrank 1 MB -> 512 KB to make room; main() verifies at
+ * runtime that the linker's SRAM01_HYPERRAM spill still ends below
+ * DEMO_GUARD_END before initialising the models. Do NOT enable the Day-1
+ * tests and the Day-3 demo in the same build — their HyperRAM plans overlap.
+ * --------------------------------------------------------------------------*/
+#define DEMO_GUARD_END         (HYPERRAM_BASE + 0x00080000UL)  /* 0x82080000 */
+
+#define EMBED_MODEL_ADDR       (DEMO_GUARD_END)                /* 0x82080000 */
+#define EMBED_MODEL_MAXSZ      (0x00340000UL)                  /* 3.25 MB    */
+
+#define HAND_MODEL_ADDR        (EMBED_MODEL_ADDR + EMBED_MODEL_MAXSZ)  /* 0x823C0000 */
+#define HAND_MODEL_MAXSZ       (0x00240000UL)                  /* 2.25 MB    */
+#define HAND_MODEL_FILE        "0:\\hand_landmark.tflite"      /* SD root; 2,268,704 B CRC32 0xF050E6FE */
+
+#define HAND_ARENA_ADDR        (HAND_MODEL_ADDR + HAND_MODEL_MAXSZ)    /* 0x82600000 */
+#define HAND_ARENA_SZ          (0x00100000UL)                  /* 1 MB (sample needs ~1011 KB) */
+
+_Static_assert(HAND_ARENA_ADDR + HAND_ARENA_SZ <= SLIDESHOW_FB_ADDR,
+               "Demo HyperRAM plan collides with the slideshow buffer!");
+
 _Static_assert(SLIDESHOW_FB_ADDR + SLIDESHOW_FB_SIZE <= HYPERRAM_END,
                "Slideshow frame buffer exceeds HyperRAM!");
 

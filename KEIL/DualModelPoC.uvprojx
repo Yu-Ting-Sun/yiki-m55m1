@@ -568,6 +568,11 @@
               <FilePath>..\DetectorPostProcessing.cpp</FilePath>
             </File>
             <File>
+              <FileName>GestureLike.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\GestureLike.cpp</FilePath>
+            </File>
+            <File>
               <FileName>FaceRecog.cpp</FileName>
               <FileType>8</FileType>
               <FilePath>..\FaceRecog.cpp</FilePath>
@@ -616,6 +621,11 @@
               <FileName>FaceModel.cpp</FileName>
               <FileType>8</FileType>
               <FilePath>..\Model\FaceModel.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>HandLandmarkModel.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>..\Model\HandLandmarkModel.cpp</FilePath>
             </File>
             <File>
               <FileName>GestureModel.cpp</FileName>

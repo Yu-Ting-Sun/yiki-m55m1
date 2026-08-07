@@ -376,6 +376,10 @@ static DIR     s_iterDir;
 static bool    s_iterOpen;
 static uint8_t s_cursor;                     /* index into s_matched */
 static uint8_t s_albumsDone;                 /* albums exhausted this cycle */
+
+/* What is on screen right now (for the gesture-like report). */
+static char    s_curFolder[LIB_NAME_LEN];    /* "" = root pseudo-album */
+static char    s_curPhoto[64];               /* "" = story-only slide  */
 static uint32_t s_shownInCycle;
 static uint32_t s_photosThisAlbum;           /* photos shown since album open */
 
@@ -652,6 +656,8 @@ int Slideshow_ShowNext(void)
             {
                 S_DISP_RECT r = { 0, 0, panelW - 1u, panelH - 1u };
                 Display_ClearRect(C_BLACK, &r);
+                strncpy(s_curFolder, s_albums[doneIdx].name, sizeof(s_curFolder) - 1);
+                s_curPhoto[0] = '\0';           /* story-only, no photo */
                 s_shownInCycle++;
                 return 0;
             }
@@ -702,9 +708,26 @@ int Slideshow_ShowNext(void)
         /* Photo is up: make the story rail match the album it came from. */
         story_follow_album(s_matched[s_cursor]);
 
+        strncpy(s_curFolder, al->name, sizeof(s_curFolder) - 1);
+        strncpy(s_curPhoto, fno.fname, sizeof(s_curPhoto) - 1);
+
         s_photosThisAlbum++;
         s_shownInCycle++;
         return 0;
+    }
+}
+
+void Slideshow_GetCurrent(char *folder, int folderCap, char *photo, int photoCap)
+{
+    if (folder && folderCap > 0)
+    {
+        strncpy(folder, s_curFolder, (size_t)folderCap - 1);
+        folder[folderCap - 1] = '\0';
+    }
+    if (photo && photoCap > 0)
+    {
+        strncpy(photo, s_curPhoto, (size_t)photoCap - 1);
+        photo[photoCap - 1] = '\0';
     }
 }
 

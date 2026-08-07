@@ -665,3 +665,21 @@ int SdSync_Poll(void)
     printf("[SYNC] app requested sync\n");
     return SdSync_Run(false);
 }
+
+int SdSync_PostLike(const char *folder, const char *photo, const char *user)
+{
+    char path[48], body[160], resp[96];
+
+    if (!s_wifiUp)
+        return -1;
+
+    snprintf(path, sizeof(path), "/frames/%d/like", s_frameId);
+    snprintf(body, sizeof(body),
+             "{\"folder\":\"%s\",\"photo\":\"%s\",\"user\":\"%s\"}",
+             folder ? folder : "", photo ? photo : "", user ? user : "");
+
+    int st = http_post_json(BACKEND_HOST, BACKEND_PORT, path,
+                            body, resp, sizeof(resp));
+    printf("[LIKE] POST %s %s -> %d\n", path, body, st);
+    return (st == 200) ? 0 : -2;
+}

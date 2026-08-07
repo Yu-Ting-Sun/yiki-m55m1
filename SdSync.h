@@ -47,6 +47,17 @@ int SdSync_Poll(void);
  */
 int SdSync_Run(bool verbose);
 
+/**
+ * @brief  Report a thumbs-up (「按讚」) to the backend:
+ *         POST /frames/<id>/like {"folder","photo","user"}.
+ *         Fire-and-forget — the caller only logs a failure.
+ * @param  folder  album on screen, e.g. "T0006" ("" allowed).
+ * @param  photo   photo file on screen, e.g. "P0012.JPG" ("" = story slide).
+ * @param  user    recognised face label ("" = unknown family member).
+ * @return 0 delivered, <0 offline / HTTP error.
+ */
+int SdSync_PostLike(const char *folder, const char *photo, const char *user);
+
 #ifdef __cplusplus
 }
 #endif

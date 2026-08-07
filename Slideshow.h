@@ -56,6 +56,13 @@ int Slideshow_SetFilter(const char *user);
 int Slideshow_ShowNext(void);
 
 /**
+ * @brief  Album folder + photo file currently on screen (for the gesture-like
+ *         report). folder "" = root pseudo-album; photo "" = story-only slide.
+ *         Either output may be NULL if not wanted.
+ */
+void Slideshow_GetCurrent(char *folder, int folderCap, char *photo, int photoCap);
+
+/**
  * @brief  Convenience wrapper: Slideshow_LibScan + ShowNext/Delay forever.
  * @param  dirPath  FATFS directory, e.g. "0:\\pictures".
  * @param  holdMs   How long each photo stays on screen (ms).
