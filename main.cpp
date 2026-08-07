@@ -639,9 +639,12 @@ int main(void)
                     (uint32_t)(uintptr_t)Image$$SRAM01_HYPERRAM$$ZI$$Limit;
 
                 if (spillEnd > DEMO_GUARD_END)
+                {
+                    /* printf_err is a two-statement macro — keep the braces */
                     printf_err("[GESTURE] arena spill 0x%08X exceeds guard "
                                "0x%08X - like feature disabled\n",
                                (unsigned)spillEnd, (unsigned)DEMO_GUARD_END);
+                }
                 else
                     glOk = camOk && (GestureLike_Init() == 0);
             }
