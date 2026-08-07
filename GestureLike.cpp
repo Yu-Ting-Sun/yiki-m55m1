@@ -30,9 +30,11 @@
 #define OUT_IDX_PRESENCE     (2)
 #define OUT_IDX_SCREEN       (3)
 
-/* A hand is only considered when the model is at least this sure (the BSP
- * sample uses 0.5). */
-#define PRESENCE_THRESHOLD   (0.5f)
+/* A hand is only considered when the model is at least this sure. The BSP
+ * sample uses 0.5, but a thumbs-up FIST scores lower than an open hand
+ * (measured p=0.50 on-board, right at the sample threshold) — the geometry
+ * rule plus the caller's 3-frame debounce guard against false hands. */
+#define PRESENCE_THRESHOLD   (0.35f)
 
 /* 1 = throttled UART diagnostics: a heartbeat proving the model runs, plus
  *     the rule evaluation whenever a hand is seen. Turn off for filming. */
@@ -195,25 +197,24 @@ extern "C" int GestureLike_Run(const uint16_t *frameRGB565, int w, int h)
     bool thumbUp = (thumbTipY < thumbIpY) && (thumbIpY < thumbMcpY) &&
                    ((wristY - thumbTipY) > 0.55f * span);
 
-    /* The other four fingers curled into a fist: each fingertip closer to the
-     * wrist than its PIP joint (works regardless of hand rotation). */
+    /* Other four fingertips clearly BELOW the thumb tip: in a thumbs-up
+     * fist the thumb is the topmost point by a wide margin. (A strict
+     * tip-closer-to-wrist-than-PIP curl test failed on-board — the landmark
+     * model places folded fingertips as if extended, real fists scored 0/4.
+     * An open hand pointing up still fails this rule: its fingertips sit
+     * ABOVE the thumb tip.) */
     static const uint8_t tips[4] = { 8, 12, 16, 20 };
-    static const uint8_t pips[4] = { 6, 10, 14, 18 };
-    bool curled = true;
-    int  nCurled = 0;
+    int nBelow = 0;
     for (int f = 0; f < 4; f++)
-    {
-        if (d2(lm, tips[f], 0) < d2(lm, pips[f], 0))
-            nCurled++;
-        else
-            curled = false;
-    }
+        if (lm[tips[f] * 3 + 1] > thumbTipY + 0.35f * span)
+            nBelow++;
+    bool tipsBelow = (nBelow == 4);
 
 #if GESTURE_LIKE_LOG
     printf("[GESTURE] hand p=%.2f span=%.0f thumbUp=%d (rise %.0f/%.0f) "
-           "curled=%d/4\n", presence, span, thumbUp ? 1 : 0,
-           wristY - thumbTipY, 0.55f * span, nCurled);
+           "below=%d/4\n", presence, span, thumbUp ? 1 : 0,
+           wristY - thumbTipY, 0.55f * span, nBelow);
 #endif
 
-    return (thumbUp && curled) ? 1 : 0;
+    return (thumbUp && tipsBelow) ? 1 : 0;
 }
