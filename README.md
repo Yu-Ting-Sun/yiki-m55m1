@@ -96,6 +96,9 @@ uvicorn main:app --host 0.0.0.0 --port 8000
     參加者在 App 旅程詳情頁編輯（PUT /trips/{id}/members）。
 - `0:\face_mobilenet.tflite` — 人臉 embedding 模型（Vela 版，3.17 MB，
   從 BSP `SampleCode\NuEdgeWise\FaceRecognition\Model\` 複製）— 人臉辨識必需
+- `0:\hand_landmark.tflite` — 手勢按讚模型（MediaPipe 21 關鍵點，Vela 版，
+  2.17 MB，repo `models\hand_landmark.tflite` 直接複製）— 手勢按讚必需；
+  缺檔時相框照常運作、只是沒有按讚功能
 - `0:\faces\` — `embeddings.txt`（已註冊使用者的參考向量）與
   `enroll_<label>.raw`（待註冊自拍，見下方註冊流程）
 - `face_model.tflite` + `gesture_model.tflite` 放根目錄 — 只有跑 Day-1
