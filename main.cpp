@@ -90,6 +90,13 @@
  *     non-fatal (plain slideshow keeps running). Only affects RUN_DAY3_DEMO. */
 #define RUN_CAMERA_PREVIEW (1)
 
+/* 1 = draw the live camera frame in the bottom-right corner of the photo
+ *     region. 0 = the capture->detect->recognise pipeline still runs every
+ *     hold window, but nothing is drawn — recognition works silently in the
+ *     background and the frame stays a clean photo frame.
+ *     Only meaningful when RUN_CAMERA_PREVIEW=1. */
+#define SHOW_CAMERA_PREVIEW (0)
+
 /* 1 = Phase-3: run face detection (compiled-in yolo-fastest_192_face +
  *     DetectorPostProcessing) on each captured frame and draw the face boxes
  *     onto the preview. Needs RUN_CAMERA_PREVIEW. Init failure is non-fatal
@@ -552,8 +559,10 @@ int main(void)
             /* Preview sits in the bottom-right corner of the photo region.
              * No camera (init fail) degrades to the plain slideshow. */
             bool     camOk = (Camera_Init() == 0);
+#if SHOW_CAMERA_PREVIEW
             uint32_t camX  = Disaplay_GetLCDWidth() - STORYUI_RESERVED_PX - CAM_W;
             uint32_t camY  = Disaplay_GetLCDHeight() - CAM_H;
+#endif
 #if RUN_FACE_DETECT
             /* Face detection draws boxes onto the frame before it is blitted.
              * Init failure degrades to plain preview (no boxes). */
@@ -668,7 +677,9 @@ int main(void)
                             printf("[PHOTO-ENROLL] no face detected in %s\n",
                                    rawPath);
 
+#if SHOW_CAMERA_PREVIEW
                         Camera_Blit(camX, camY);   /* show photo + box briefly */
+#endif
                     }
                     else
                         printf("[PHOTO-ENROLL] bad size in %s: read %u, want %u\n",
@@ -749,7 +760,9 @@ int main(void)
                         SlideFilter_Update(seenUser);
 #endif
 #endif
+#if SHOW_CAMERA_PREVIEW
                         Camera_Blit(camX, camY);
+#endif
                         continue;
                     }
 #endif
