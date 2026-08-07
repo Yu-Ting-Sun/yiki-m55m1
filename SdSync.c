@@ -227,6 +227,31 @@ static void version_write(const char *dir, const char *ver)
     }
 }
 
+/* 8-char version sidecar (face files: enroll_x.ver, written at download
+ * time) — detects a re-registered face whose file NAME did not change. */
+static bool file_ver_matches(const char *path, const char *ver)
+{
+    char cur[9];
+    UINT br = 0;
+
+    if (f_open(&s_file, path, FA_OPEN_EXISTING | FA_READ) != FR_OK)
+        return false;
+    f_read(&s_file, cur, 8, &br);
+    f_close(&s_file);
+    return (br == 8 && strncmp(cur, ver, 8) == 0);
+}
+
+static void file_ver_write(const char *path, const char *ver)
+{
+    UINT bw = 0;
+
+    if (f_open(&s_file, path, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
+    {
+        f_write(&s_file, ver, 8, &bw);
+        f_close(&s_file);
+    }
+}
+
 /* GET urlPath -> SD sdPath (whole file through DL_BUF). 0 on success. */
 static int dl_to_file(const char *urlPath, const char *sdPath)
 {
@@ -584,27 +609,64 @@ static int sync_faces(const char *man, const char *end, const char *facesRoot)
     for (const char *o = next_obj(a, aEnd, &oEnd); o;
          o = next_obj(oEnd, aEnd, &oEnd))
     {
+        char ver[16], verPath[120];
+
         if (get_str(o, oEnd, "name", name, sizeof(name)) != 0 ||
             get_str(o, oEnd, "url", url, sizeof(url)) != 0)
             continue;
+
+        bool hasVer = (get_str(o, oEnd, "version", ver, sizeof(ver)) == 0 &&
+                       strlen(ver) == 8);
 
         if (nHave < 24 && strlen(name) < sizeof(haveName[0]) &&
             face_file_label(name, haveLbl[nHave], sizeof(haveLbl[0])))
             strcpy(haveName[nHave++], name);
 
-        /* PHOTO-ENROLL renames name.raw -> name.done after enrolling. */
+        /* PHOTO-ENROLL renames name.raw -> name.done after enrolling.
+         * The .ver sidecar (written at download time) records which backend
+         * content this card copy came from. */
         snprintf(sdPath, sizeof(sdPath), "%s\\%s", dir, name);
         snprintf(donePath, sizeof(donePath), "%s", sdPath);
+        snprintf(verPath, sizeof(verPath), "%s", sdPath);
         {
             size_t nl = strlen(donePath);
             if (nl > 4 && strcmp(&donePath[nl - 4], ".raw") == 0)
+            {
                 memcpy(&donePath[nl - 4], ".done", 6);
+                memcpy(&verPath[nl - 4], ".ver", 5);
+            }
         }
-        if (sd_exists(sdPath) || sd_exists(donePath))
+
+        bool haveLocal = sd_exists(sdPath) || sd_exists(donePath);
+
+        /* Same NAME is not enough: a re-registered face reuses the file
+         * name with new content. Only skip when the version also matches
+         * (no manifest version = legacy backend: name check only). */
+        if (haveLocal && (!hasVer || file_ver_matches(verPath, ver)))
             continue;                   /* already fetched / already enrolled */
 
+        if (haveLocal)
+        {
+            char lbl[24];
+
+            f_unlink(sdPath);
+            f_unlink(donePath);
+            f_unlink(verPath);
+            printf("[SYNC] face file %s changed on backend - refreshing\n",
+                   name);
+            /* The old face's reference vectors are stale now. */
+            if (face_file_label(name, lbl, sizeof(lbl)) &&
+                FaceRecog_ForgetLabel(lbl) > 0)
+                printf("[SYNC] face '%s' re-registered - old references "
+                       "purged\n", lbl);
+        }
+
         if (dl_to_file(url, sdPath) == 0)
+        {
+            if (hasVer)
+                file_ver_write(verPath, ver);
             added++;
+        }
     }
 
     /* Prune: enrollment files on the card (either .raw or .done) whose .raw
@@ -653,6 +715,16 @@ static int sync_faces(const char *man, const char *end, const char *facesRoot)
             if (f_unlink(p) == FR_OK)
                 printf("[SYNC] face file %s removed (deleted in app)\n",
                        stale[i]);
+
+            /* Drop the .ver sidecar of the .raw-equivalent name too. */
+            {
+                size_t pn = strlen(p);
+                if (pn > 5 && strcmp(&p[pn - 5], ".done") == 0)
+                    memcpy(&p[pn - 5], ".ver", 5);
+                else if (pn > 4 && strcmp(&p[pn - 4], ".raw") == 0)
+                    memcpy(&p[pn - 4], ".ver", 5);
+                f_unlink(p);            /* may not exist; ignore result */
+            }
 
             /* Last file of the label gone -> forget the person entirely. */
             if (face_file_label(stale[i], lbl, sizeof(lbl)))
