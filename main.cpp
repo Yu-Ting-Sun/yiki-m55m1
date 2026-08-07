@@ -560,8 +560,12 @@ static void LikeGesture_Update(int seen)
 
     printf("[LIKE] thumbs-up confirmed: %s/%s by '%s'\n",
            folder, photo, user[0] ? user : "(unknown)");
-    StoryUI_ShowStatus("Like sent <3");
-    SdSync_PostLike(folder, photo, user);
+
+    /* Rail feedback reflects the actual delivery (POST is ~0.3 s). */
+    if (SdSync_PostLike(folder, photo, user) == 0)
+        StoryUI_ShowStatus("Like sent <3");
+    else
+        StoryUI_ShowStatus("Like failed :(");
 }
 #endif /* RUN_GESTURE_LIKE */
 
