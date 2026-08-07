@@ -57,6 +57,16 @@ const char *FaceRecog_GetLabel(void);
 int FaceRecog_Enroll(uint16_t *frame, int fw, int fh, const FaceBox *box,
                      const char *label);
 
+/**
+ * @brief  Remove every reference for `label`: in-RAM entries (recognition
+ *         stops matching immediately) AND the label's lines in
+ *         0:\faces\embeddings.txt (stream-filtered rewrite). Used by the
+ *         sync prune when a face is deleted in the App. Safe to call when
+ *         recognition never initialised.
+ * @return number of references removed (0 = label unknown), <0 on SD error.
+ */
+int FaceRecog_ForgetLabel(const char *label);
+
 #ifdef __cplusplus
 }
 #endif

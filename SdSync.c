@@ -37,6 +37,7 @@
 #include "StoryUI.h"
 #include "esp_at.h"
 #include "esp_http.h"
+#include "FaceRecog.hpp"    /* FaceRecog_ForgetLabel (face prune) */
 
 /* Fresh clone: fall back to placeholder creds so the project still builds. */
 #if defined(__has_include) && !__has_include("day2_config.h")
@@ -525,12 +526,51 @@ static int prune_albums(const char *sdRoot, char kept[][16], int nKept)
     return removed;
 }
 
+/* enroll_<label>[-N].(raw|done) -> label ("-N" = extra reference photo).
+ * Returns false when fname is not an enrollment file. */
+static bool face_file_label(const char *fname, char *label, int cap)
+{
+    size_t      n   = strlen(fname);
+    const char *ext = NULL;
+
+    if (strncmp(fname, "enroll_", 7) != 0)
+        return false;
+    if (n > 4 && strcmp(&fname[n - 4], ".raw") == 0)
+        ext = &fname[n - 4];
+    else if (n > 5 && strcmp(&fname[n - 5], ".done") == 0)
+        ext = &fname[n - 5];
+    else
+        return false;
+
+    int ll = (int)(ext - (fname + 7));
+    if (ll <= 0 || ll >= cap)
+        return false;
+    memcpy(label, fname + 7, (size_t)ll);
+    label[ll] = '\0';
+
+    char *dash = strrchr(label, '-');
+    if (dash && dash[1])
+    {
+        bool digits = true;
+        for (char *p = dash + 1; *p; p++)
+            if (*p < '0' || *p > '9') digits = false;
+        if (digits) *dash = '\0';
+    }
+    return true;
+}
+
 /* Download enrollment raws we have never seen (neither .raw nor .raw.done
- * on the card). Returns the number of new files. */
+ * on the card), then prune files the manifest no longer lists (face deleted
+ * in the App) — including the label's reference embeddings when its last
+ * file goes. Returns the number of new files. */
 static int sync_faces(const char *man, const char *end, const char *facesRoot)
 {
     char name[48], url[96], sdPath[112], donePath[120];
     int  added = 0;
+
+    static char haveName[24][44];       /* manifest raw file names */
+    static char haveLbl[24][24];        /* their labels            */
+    int nHave = 0;
 
     const char *aEnd, *oEnd;
     const char *a = find_array(man, end, "faces", &aEnd);
@@ -548,6 +588,10 @@ static int sync_faces(const char *man, const char *end, const char *facesRoot)
             get_str(o, oEnd, "url", url, sizeof(url)) != 0)
             continue;
 
+        if (nHave < 24 && strlen(name) < sizeof(haveName[0]) &&
+            face_file_label(name, haveLbl[nHave], sizeof(haveLbl[0])))
+            strcpy(haveName[nHave++], name);
+
         /* PHOTO-ENROLL renames name.raw -> name.done after enrolling. */
         snprintf(sdPath, sizeof(sdPath), "%s\\%s", dir, name);
         snprintf(donePath, sizeof(donePath), "%s", sdPath);
@@ -561,6 +605,66 @@ static int sync_faces(const char *man, const char *end, const char *facesRoot)
 
         if (dl_to_file(url, sdPath) == 0)
             added++;
+    }
+
+    /* Prune: enrollment files on the card (either .raw or .done) whose .raw
+     * name the manifest no longer lists = face deleted in the App. Collect
+     * first, delete after closedir (same rule as prune_albums). Only files
+     * matching the enroll pattern are touched — embeddings.txt, the model
+     * files and live-enrolled labels (no files) are never affected. */
+    {
+        static char stale[16][44];
+        int  nStale = 0;
+        DIR     dj;
+        FILINFO fno;
+
+        if (f_opendir(&dj, dir) == FR_OK)
+        {
+            while (nStale < 16 && f_readdir(&dj, &fno) == FR_OK && fno.fname[0])
+            {
+                char lbl[24], rawName[48];
+
+                if (fno.fattrib & AM_DIR)
+                    continue;
+                if (strlen(fno.fname) >= sizeof(stale[0]) ||
+                    !face_file_label(fno.fname, lbl, sizeof(lbl)))
+                    continue;
+
+                /* compare by the .raw-equivalent name */
+                strcpy(rawName, fno.fname);
+                size_t rn = strlen(rawName);
+                if (rn > 5 && strcmp(&rawName[rn - 5], ".done") == 0)
+                    memcpy(&rawName[rn - 5], ".raw", 5);
+
+                bool listed = false;
+                for (int i = 0; i < nHave; i++)
+                    if (strcmp(haveName[i], rawName) == 0) { listed = true; break; }
+                if (!listed)
+                    strcpy(stale[nStale++], fno.fname);
+            }
+            f_closedir(&dj);
+        }
+
+        for (int i = 0; i < nStale; i++)
+        {
+            char p[80], lbl[24];
+
+            snprintf(p, sizeof(p), "%s\\%s", dir, stale[i]);
+            if (f_unlink(p) == FR_OK)
+                printf("[SYNC] face file %s removed (deleted in app)\n",
+                       stale[i]);
+
+            /* Last file of the label gone -> forget the person entirely. */
+            if (face_file_label(stale[i], lbl, sizeof(lbl)))
+            {
+                bool still = false;
+                for (int k = 0; k < nHave; k++)
+                    if (strcmp(haveLbl[k], lbl) == 0) { still = true; break; }
+                if (!still && FaceRecog_ForgetLabel(lbl) > 0)
+                    printf("[SYNC] face '%s' forgotten (embeddings purged)\n",
+                           lbl);
+            }
+        }
     }
     return added;
 }

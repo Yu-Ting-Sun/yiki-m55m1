@@ -264,3 +264,100 @@ extern "C" int FaceRecog_Enroll(uint16_t *frame, int fw, int fh,
            label, (unsigned)emb.size(), EMBED_REF_FILE);
     return 0;
 }
+
+extern "C" int FaceRecog_ForgetLabel(const char *label)
+{
+    if (!label || !label[0]) return -1;
+
+    /* 1) In-RAM references: recognition stops matching immediately. */
+    int removed = 0;
+    for (size_t i = s_labels.size(); i-- > 0; )
+        if (s_labels[i].szLable == label)
+        {
+            s_labels.erase(s_labels.begin() + (long)i);
+            removed++;
+        }
+
+    /* 2) SD file: stream-filter embeddings.txt line by line, dropping the
+     * label's lines ("label:v0:v1:...:"). Works even when recognition never
+     * initialised (file may still hold the label from an earlier boot). */
+    FIL src, dst;
+    if (f_open(&src, EMBED_REF_FILE, FA_READ) != FR_OK)
+        return removed;                 /* no reference file: RAM-only purge */
+
+    const char *tmpPath = EMBED_REF_DIR "\\embeddings.tmp";
+    if (f_open(&dst, tmpPath, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK)
+    {
+        f_close(&src);
+        printf("[FACEREC] forget '%s': cannot create temp file\n", label);
+        return -2;
+    }
+
+    char rbuf[512], lbl[32];
+    UINT br = 0, bw = 0;
+    int  li = 0;
+    bool inLabel = true, keep = true, dropped = false, ioErr = false;
+
+    for (;;)
+    {
+        if (f_read(&src, rbuf, sizeof(rbuf), &br) != FR_OK) { ioErr = true; break; }
+        if (br == 0) break;
+
+        for (UINT i = 0; i < br && !ioErr; i++)
+        {
+            char c = rbuf[i];
+
+            if (inLabel)
+            {
+                if (c == ':' || c == '\n' || li >= (int)sizeof(lbl) - 1)
+                {
+                    lbl[li] = '\0';
+                    keep = (strcmp(lbl, label) != 0);
+                    if (!keep) dropped = true;
+                    if (keep &&
+                        (f_write(&dst, lbl, (UINT)li, &bw) != FR_OK ||
+                         f_write(&dst, &c, 1, &bw) != FR_OK))
+                        ioErr = true;
+                    inLabel = (c == '\n');
+                    li = 0;
+                }
+                else
+                    lbl[li++] = c;
+            }
+            else
+            {
+                if (keep && f_write(&dst, &c, 1, &bw) != FR_OK)
+                    ioErr = true;
+                if (c == '\n') inLabel = true;
+            }
+        }
+        if (ioErr) break;
+    }
+
+    /* Trailing partial label (file without final newline): keep it. */
+    if (!ioErr && inLabel && li > 0 &&
+        f_write(&dst, lbl, (UINT)li, &bw) != FR_OK)
+        ioErr = true;
+
+    f_close(&src);
+    f_close(&dst);
+
+    if (ioErr)
+    {
+        f_unlink(tmpPath);
+        printf("[FACEREC] forget '%s': SD I/O error, file kept\n", label);
+        return -2;
+    }
+
+    if (dropped)
+    {
+        f_unlink(EMBED_REF_FILE);
+        f_rename(tmpPath, EMBED_REF_FILE);
+        printf("[FACEREC] forgot '%s' (%d RAM ref(s), file rewritten)\n",
+               label, removed);
+    }
+    else
+        f_unlink(tmpPath);              /* label not in file: nothing changed */
+
+    return removed + (dropped ? 1 : 0);
+}
