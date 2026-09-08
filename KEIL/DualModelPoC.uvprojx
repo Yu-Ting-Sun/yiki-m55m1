@@ -518,6 +518,11 @@
               <FilePath>..\Slideshow.c</FilePath>
             </File>
             <File>
+              <FileName>Button.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Button.c</FilePath>
+            </File>
+            <File>
               <FileName>StoryUI.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\StoryUI.c</FilePath>
