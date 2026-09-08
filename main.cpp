@@ -133,16 +133,10 @@
  *   nobody drops the filter back to playing everything.
  *
  * RUN_UNLOCK_BUTTON adds the second, manual way out: a press on the board
- * button (Button.c) unlocks immediately, without waiting for LOCK_HOLD_MS. */
+ * button (Button.c) forces that re-check straight away, without waiting out
+ * LOCK_HOLD_MS. */
 #define LOCK_HOLD_MS       (60000)
 #define RUN_UNLOCK_BUTTON  (1)
-
-/* A manual unlock means "not me" — but the person who triggered the lock is
- * usually still standing in front of the frame, and would be re-recognised
- * (and re-locked) within FILTER_SWITCH_HITS frames, making the button a
- * no-op. So recognition verdicts are ignored for this long after a manual
- * unlock. The timed re-check does NOT use this cooldown. */
-#define LOCK_UNLOCK_COOLDOWN_MS (30000)
 
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
@@ -480,9 +474,11 @@ static bool test_alternating(void)
  *           clears an active filter (back to playing everything).
  *   LOCKED  inference and preview are both off (the caller asks with
  *           SlideFilter_IsLocked()). Leaves the lock on LOCK_HOLD_MS elapsing
- *           or on SlideFilter_Unlock() from the button, both of which return
- *           to SCAN with the filter still applied — so the re-check either
- *           re-locks on whoever is there, or times out and plays everything.
+ *           or on SlideFilter_Unlock() from the button — the same exit either
+ *           way: back to SCAN with the filter still applied, so the re-check
+ *           re-locks on whoever is in front of the frame (the same person
+ *           keeps their albums, a different one switches to theirs), and only
+ *           FILTER_CLEAR_MS of nobody falls back to playing everything.
  *--------------------------------------------------------------------------*/
 static char     s_curUser[32]  = "";   /* active filter, "" = play all */
 static char     s_candUser[32] = "";
@@ -490,9 +486,6 @@ static int      s_candHits     = 0;
 static uint32_t s_lastSeenMs   = 0;
 static bool     s_locked       = false;
 static uint32_t s_lockedAtMs   = 0;
-static bool     s_cooldown     = false;   /* ignore verdicts after a manual
-                                             unlock (LOCK_UNLOCK_COOLDOWN_MS) */
-static uint32_t s_unlockedAtMs = 0;
 
 static bool SlideFilter_IsLocked(void)
 {
@@ -509,23 +502,19 @@ static bool SlideFilter_IsLocked(void)
     return s_locked;
 }
 
-/* Manual unlock (button). Unlike the timed re-check this also drops the
- * filter straight away: the viewer is telling the frame "not me". */
+/* Manual unlock (button): bring the timed re-check forward to now. The
+ * filter stays applied meanwhile, so recognising the same person again is
+ * seamless and only a real absence falls back to everything. */
 static void SlideFilter_Unlock(void)
 {
     if (!s_locked)
         return;
 
-    s_locked       = false;
-    s_curUser[0]   = '\0';
-    s_candUser[0]  = '\0';
-    s_candHits     = 0;
-    s_lastSeenMs   = GetSystemTick_ms();
-    s_cooldown     = true;
-    s_unlockedAtMs = s_lastSeenMs;
-    Slideshow_SetFilter(NULL);
-    printf("[LOCK] released by button -> playing all albums "
-           "(ignoring faces for %u ms)\n", (unsigned)LOCK_UNLOCK_COOLDOWN_MS);
+    s_locked      = false;
+    s_candUser[0] = '\0';
+    s_candHits    = 0;
+    s_lastSeenMs  = GetSystemTick_ms();
+    printf("[LOCK] released by button — re-checking now\n");
 }
 
 /* Called once per captured camera frame with the recognised label, or NULL
@@ -533,14 +522,6 @@ static void SlideFilter_Unlock(void)
  * unavailable). Only called while unlocked. */
 static void SlideFilter_Update(const char *label)
 {
-    if (s_cooldown)
-    {
-        if ((GetSystemTick_ms() - s_unlockedAtMs) < LOCK_UNLOCK_COOLDOWN_MS)
-            return;
-
-        s_cooldown = false;
-    }
-
     if (label != NULL)
     {
         s_lastSeenMs = GetSystemTick_ms();
