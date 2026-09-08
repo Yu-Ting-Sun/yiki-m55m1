@@ -97,8 +97,8 @@
  *     compute its embedding and APPEND "ENROLL_LABEL:embedding" to the SD
  *     reference file, then stop. Flash once per person (change ENROLL_LABEL),
  *     then flash again with RUN_FACE_ENROLL=0 to recognise. Needs RUN_FACE_RECOG. */
-#define RUN_FACE_ENROLL    (0)
-#define ENROLL_LABEL       "user1"
+#define RUN_FACE_ENROLL    (1)
+#define ENROLL_LABEL       "dylan"
 #define ENROLL_SAMPLES     (8)   /* how many embeddings to append per enroll run */
 
 /* 1 = photo enrollment at boot (the App-registration path): every
