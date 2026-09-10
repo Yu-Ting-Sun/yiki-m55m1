@@ -36,6 +36,7 @@
 #include "FaceDetect.hpp"
 #include "FaceRecog.hpp"
 #include "GestureLike.hpp"
+#include "Button.h"
 #include "esp_probe.h"
 #include "day2_test.h"
 #include "day3_demo.h"
@@ -116,7 +117,7 @@
  *     reference file, then stop. Flash once per person (change ENROLL_LABEL),
  *     then flash again with RUN_FACE_ENROLL=0 to recognise. Needs RUN_FACE_RECOG. */
 #define RUN_FACE_ENROLL    (0)
-#define ENROLL_LABEL       "user1"
+#define ENROLL_LABEL       "dylan"
 #define ENROLL_SAMPLES     (8)   /* how many embeddings to append per enroll run */
 
 /* 1 = photo enrollment at boot (the App-registration path): every
@@ -148,6 +149,24 @@
  * (play everything). Slideshow_SetFilter takes effect at the next photo. */
 #define FILTER_SWITCH_HITS (3)
 #define FILTER_CLEAR_MS    (5000)
+
+/* Recognition lock. Recognising continuously is visually noisy (the box
+ * flickers red/green as single-frame cosine crosses the threshold) and the
+ * viewer has no way to tell the frame "yes, that's me". So once the debounce
+ * above settles on a user the frame LOCKS: inference and the corner preview
+ * both stop, leaving a clean photo frame playing that user's albums.
+ *
+ *   LOCK_HOLD_MS   how long the lock holds before the frame re-checks who is
+ *                  in front of it (preview + boxes come back for the check).
+ *   The re-check is just the normal scanning state: recognising somebody
+ *   (same person or a different one) locks again, while FILTER_CLEAR_MS of
+ *   nobody drops the filter back to playing everything.
+ *
+ * RUN_UNLOCK_BUTTON adds the second, manual way out: a press on the board
+ * button (Button.c) forces that re-check straight away, without waiting out
+ * LOCK_HOLD_MS. */
+#define LOCK_HOLD_MS       (60000)
+#define RUN_UNLOCK_BUTTON  (1)
 
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
@@ -475,46 +494,99 @@ static bool test_alternating(void)
 
 #if RUN_FACE_RECOG && !RUN_FACE_ENROLL
 /*----------------------------------------------------------------------------
- * Phase-5: debounced recognition -> slideshow album filter. Called once per
- * captured camera frame with the recognised label, or NULL when nobody was
- * recognised this frame (no face, unknown face, or recog unavailable).
+ * Phase-5: debounced recognition -> slideshow album filter, plus the
+ * recognition lock (see LOCK_HOLD_MS).
+ *
+ * Two states:
+ *   SCAN    inference runs on every captured frame and the preview shows the
+ *           detection box. FILTER_SWITCH_HITS consecutive same-label frames
+ *           set the filter and LOCK; FILTER_CLEAR_MS with nobody recognised
+ *           clears an active filter (back to playing everything).
+ *   LOCKED  inference and preview are both off (the caller asks with
+ *           SlideFilter_IsLocked()). Leaves the lock on LOCK_HOLD_MS elapsing
+ *           or on SlideFilter_Unlock() from the button — the same exit either
+ *           way: back to SCAN with the filter still applied, so the re-check
+ *           re-locks on whoever is in front of the frame (the same person
+ *           keeps their albums, a different one switches to theirs), and only
+ *           FILTER_CLEAR_MS of nobody falls back to playing everything.
  *--------------------------------------------------------------------------*/
-static char s_filterUser[32] = "";   /* active filter, "" = play all
-                                        (also names the liker, Phase-6) */
+static char     s_filterUser[32] = "";   /* active filter, "" = play all
+                                            (also names the liker, Phase-6) */
+static char     s_candUser[32] = "";
+static int      s_candHits     = 0;
+static uint32_t s_lastSeenMs   = 0;
+static bool     s_locked       = false;
+static uint32_t s_lockedAtMs   = 0;
 
+static bool SlideFilter_IsLocked(void)
+{
+    if (s_locked && (GetSystemTick_ms() - s_lockedAtMs) >= LOCK_HOLD_MS)
+    {
+        s_locked      = false;
+        s_candHits    = 0;
+        s_candUser[0] = '\0';
+        s_lastSeenMs  = GetSystemTick_ms();   /* start the re-check window */
+        printf("[LOCK] re-checking after %u ms — recognition back on\n",
+               (unsigned)LOCK_HOLD_MS);
+    }
+
+    return s_locked;
+}
+
+/* Manual unlock (button): bring the timed re-check forward to now. The
+ * filter stays applied meanwhile, so recognising the same person again is
+ * seamless and only a real absence falls back to everything. */
+static void SlideFilter_Unlock(void)
+{
+    if (!s_locked)
+        return;
+
+    s_locked      = false;
+    s_candUser[0] = '\0';
+    s_candHits    = 0;
+    s_lastSeenMs  = GetSystemTick_ms();
+    printf("[LOCK] released by button — re-checking now\n");
+}
+
+/* Called once per captured camera frame with the recognised label, or NULL
+ * when nobody was recognised this frame (no face, unknown face, or recog
+ * unavailable). Only called while unlocked. */
 static void SlideFilter_Update(const char *label)
 {
-    static char     candUser[32] = "";
-    static int      candHits     = 0;
-    static uint32_t lastSeenMs   = 0;
-
     if (label != NULL)
     {
-        lastSeenMs = GetSystemTick_ms();
+        s_lastSeenMs = GetSystemTick_ms();
 
-        if (strncmp(label, candUser, sizeof(candUser)) != 0)
+        if (strncmp(label, s_candUser, sizeof(s_candUser)) != 0)
         {
-            strncpy(candUser, label, sizeof(candUser) - 1);
-            candUser[sizeof(candUser) - 1] = '\0';
-            candHits = 1;
+            strncpy(s_candUser, label, sizeof(s_candUser) - 1);
+            s_candUser[sizeof(s_candUser) - 1] = '\0';
+            s_candHits = 1;
         }
-        else if (candHits < FILTER_SWITCH_HITS)
-            candHits++;
+        else if (s_candHits < FILTER_SWITCH_HITS)
+            s_candHits++;
 
-        if (candHits >= FILTER_SWITCH_HITS &&
-            strncmp(candUser, s_filterUser, sizeof(s_filterUser)) != 0)
+        if (s_candHits >= FILTER_SWITCH_HITS)
         {
-            strcpy(s_filterUser, candUser);
-            int n = Slideshow_SetFilter(s_filterUser);
-            printf("[FILTER] -> '%s' (%d album(s))\n", s_filterUser, n);
+            if (strncmp(s_candUser, s_filterUser, sizeof(s_filterUser)) != 0)
+            {
+                strcpy(s_filterUser, s_candUser);
+                int n = Slideshow_SetFilter(s_filterUser);
+                printf("[FILTER] -> '%s' (%d album(s))\n", s_filterUser, n);
+            }
+
+            s_locked     = true;
+            s_lockedAtMs = GetSystemTick_ms();
+            printf("[LOCK] holding '%s' for %u ms — recognition paused\n",
+                   s_filterUser, (unsigned)LOCK_HOLD_MS);
         }
     }
     else if (s_filterUser[0] != '\0' &&
-             (GetSystemTick_ms() - lastSeenMs) > FILTER_CLEAR_MS)
+             (GetSystemTick_ms() - s_lastSeenMs) > FILTER_CLEAR_MS)
     {
-        s_filterUser[0] = '\0';
-        candUser[0] = '\0';
-        candHits    = 0;
+        s_filterUser[0]  = '\0';
+        s_candUser[0] = '\0';
+        s_candHits    = 0;
         Slideshow_SetFilter(NULL);
         printf("[FILTER] -> all (nobody recognised for %u ms)\n",
                (unsigned)FILTER_CLEAR_MS);
@@ -625,6 +697,16 @@ int main(void)
             uint32_t camY  = Disaplay_GetLCDHeight() - CAM_H;
 #endif
 #if RUN_FACE_DETECT
+#if RUN_FACE_RECOG && !RUN_FACE_ENROLL
+#if SHOW_CAMERA_PREVIEW
+            /* Set once when the lock wipes the preview corner, so the wipe
+             * happens on the lock edge and not on every idle tick. */
+            bool previewCleared = false;
+#endif
+#if RUN_UNLOCK_BUTTON
+            Button_Init();      /* manual unlock while locked */
+#endif
+#endif
             /* Face detection draws boxes onto the frame before it is blitted.
              * Init failure degrades to plain preview (no boxes). */
             bool fdOk = camOk && (FaceDetect_Init() == 0);
@@ -824,6 +906,47 @@ int main(void)
                 while ((GetSystemTick_ms() - t0) < SLIDESHOW_HOLD_MS)
                 {
 #if RUN_CAMERA_PREVIEW
+                    /* Locked onto a viewer: face recognition pauses (the box
+                     * stops flickering red/green) and the preview corner is
+                     * wiped once, leaving a clean photo frame. Capture and the
+                     * like gesture deliberately keep running — being locked is
+                     * exactly when somebody is standing in front of the frame,
+                     * ready to thumbs-up the photo. */
+                    bool locked = false;
+#if RUN_FACE_DETECT && RUN_FACE_RECOG && !RUN_FACE_ENROLL
+                    locked = SlideFilter_IsLocked();
+
+                    if (locked)
+                    {
+#if RUN_UNLOCK_BUTTON
+                        if (Button_Pressed())
+                            SlideFilter_Unlock();
+#endif
+#if SHOW_CAMERA_PREVIEW
+                        if (!previewCleared)
+                        {
+                            S_DISP_RECT r = { camX, camY,
+                                              camX + CAM_W - 1, camY + CAM_H - 1 };
+                            Display_ClearRect(C_BLACK, &r);
+                            previewCleared = true;
+                        }
+#endif
+                    }
+#if SHOW_CAMERA_PREVIEW
+                    else
+                        previewCleared = false;
+#endif
+#if !RUN_GESTURE_LIKE
+                    /* Without the like gesture nothing else needs the camera
+                     * while locked, so idle cheaply (the PR's behaviour). */
+                    if (locked)
+                    {
+                        Display_Delay(50);
+                        continue;
+                    }
+#endif
+#endif
+                    (void)locked;
                     if (camOk)
                     {
                         if (Camera_Capture() != 0)
@@ -845,7 +968,7 @@ int main(void)
 #if RUN_FACE_RECOG && !RUN_FACE_ENROLL
                         const char *seenUser = NULL;
 #endif
-                        if (fdOk && FaceDetect_Run(frame, CAM_W, CAM_H) > 0)
+                        if (fdOk && !locked && FaceDetect_Run(frame, CAM_W, CAM_H) > 0)
                         {
                             FaceBox tb;
                             if (FaceDetect_GetTopBox(&tb))
@@ -866,7 +989,8 @@ int main(void)
                             }
                         }
 #if RUN_FACE_RECOG && !RUN_FACE_ENROLL
-                        SlideFilter_Update(seenUser);
+                        if (!locked)
+                            SlideFilter_Update(seenUser);
 #endif
 #endif
 #if SHOW_CAMERA_PREVIEW
