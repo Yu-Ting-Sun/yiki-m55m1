@@ -28,10 +28,11 @@ int Button_Init(void);
 
 /**
  * @brief  Poll the button and report one press per physical push.
- *         Debounced by BUTTON_DEBOUNCE_MS of a stable level; the press is
- *         reported on the release edge, so holding the button down does not
- *         repeat. Call regularly (every few tens of ms) or presses are missed.
- * @return 1 if a press completed since the last call, 0 otherwise.
+ *         Reported on the first poll that sees the button down, and re-armed
+ *         only once a poll sees it up, so holding it does not repeat. Safe to
+ *         poll slowly: the caller's loop turns every 150-200 ms and a press
+ *         still registers from a single sample (see Button.c).
+ * @return 1 if a new press was seen on this call, 0 otherwise.
  */
 int Button_Pressed(void);
 

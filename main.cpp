@@ -97,7 +97,7 @@
  *     hold window, but nothing is drawn — recognition works silently in the
  *     background and the frame stays a clean photo frame.
  *     Only meaningful when RUN_CAMERA_PREVIEW=1. */
-#define SHOW_CAMERA_PREVIEW (0)   /* 拍片用乾淨畫面;要 debug 鏡頭改 1 */
+#define SHOW_CAMERA_PREVIEW (1)   /* 測試中:要乾淨畫面拍片再改回 0 */
 
 /* 1 = Phase-3: run face detection (compiled-in yolo-fastest_192_face +
  *     DetectorPostProcessing) on each captured frame and draw the face boxes
@@ -608,7 +608,13 @@ static void LikeGesture_Update(int seen)
 
     if (seen <= 0)
     {
-        hits = 0;
+        /* Decay, don't reset. Measured on the board: the thumbs-up geometry
+         * sits right on its 0.55*span threshold and flickers 1/0/1, so a hard
+         * reset meant LIKE_CONFIRM_HITS consecutive hits were never reached
+         * and a real, held thumbs-up never fired. Decaying still walks back
+         * to zero once the gesture actually stops. */
+        if (hits > 0)
+            hits--;
         return;
     }
 
@@ -670,7 +676,12 @@ int main(void)
     {
         int d3 = day3_demo_run();
         if (d3 != 0)
+        {
+            /* Braces are load-bearing: printf_err is a TWO-statement macro
+             * (log_macros.h), so without them only the "ERROR - " prefix is
+             * guarded and the message prints on success too. */
             printf_err("Day-3 story failed (rc=%d) - running photos only\n", d3);
+        }
 
 #if RUN_SD_SYNC
         /* Boot sync BEFORE the library scan and photo enrollment, so albums
