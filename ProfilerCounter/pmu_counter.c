@@ -62,14 +62,42 @@ static bool add_pmu_counter(uint64_t value,
 
 /**
  * Gets the current SysTick derived counter value
+ *
+ * The upstream version "guarded" the VAL read with NVIC_DisableIRQ(SysTick_IRQn),
+ * but SysTick is a system exception (IRQn -1) and the CMSIS NVIC calls ignore
+ * negative numbers - the guard compiled to nothing. The tick could then land
+ * between reading VAL and reading the count, making the result one whole
+ * period (10 ms) off either way. Measured on the board: 134 backward steps of
+ * up to 10 ms in 20 s of polling. Every (now - t0) timeout loop that met one
+ * in its first 10 ms saw a huge elapsed time and gave up at once - the
+ * intermittent ESP_ERR_TIMEOUT on /generate that had nothing to do with how
+ * long the backend took.
+ *
+ * So mask all interrupts for these few instructions, and fold in a wrap that
+ * has happened but whose handler has not run yet.
  */
 static uint64_t Get_SysTick_Cycle_Count(void)
 {
-    uint32_t systick_val;
-    NVIC_DisableIRQ(SysTick_IRQn);
-    systick_val = SysTick->VAL & SysTick_VAL_CURRENT_Msk;
-    NVIC_EnableIRQ(SysTick_IRQn);
-    return s_u64CPUCycleCount + (SysTick->LOAD - systick_val);
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
+    uint64_t count = s_u64CPUCycleCount;
+    uint32_t load  = SysTick->LOAD;
+    uint32_t val   = SysTick->VAL & SysTick_VAL_CURRENT_Msk;
+
+    if (SCB->ICSR & SCB_ICSR_PENDSTSET_Msk)
+    {
+        /* The wrap is behind us, so a fresh VAL is from the new period -
+         * unless the counter is still sitting at 0, the old period's last
+         * cycle (the tick pends on reaching 0, the reload comes a clock
+         * later). */
+        val = SysTick->VAL & SysTick_VAL_CURRENT_Msk;
+        if (val != 0u)
+            count += (uint64_t)load + 1u;
+    }
+
+    __set_PRIMASK(primask);
+    return count + (load - val);
 }
 /**
  * SysTick initialisation
