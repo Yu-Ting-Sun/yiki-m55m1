@@ -44,6 +44,26 @@ int http_post_json_ex(const char *host, int port, const char *path,
 int http_get_binary(const char *host, int port, const char *path,
                     uint8_t *buf, int buf_cap, int *body_len, int timeout_ms);
 
+/* Response headers to pull out of a binary request. `key` is lowercase and
+ * includes the colon ("x-frame-action:"); `val` gets the value, or "" when
+ * the header is absent — including when the body came up short, so a caller
+ * can retry knowing what the answer was. */
+typedef struct
+{
+    const char *key;
+    char       *val;
+    int         cap;
+} http_hdr_out_t;
+
+/* Binary POST (application/octet-stream) of any size — the body goes out in
+ * AT+CIPSEND pieces of at most 2048 bytes — with the response handled exactly
+ * like http_get_binary: received into `buf`, body moved to its front.
+ * hdrs/nHdrs: headers to capture (NULL/0 for none). */
+int http_post_binary(const char *host, int port, const char *path,
+                     const uint8_t *body, int body_len,
+                     uint8_t *buf, int buf_cap, int *resp_len, int timeout_ms,
+                     http_hdr_out_t *hdrs, int nHdrs);
+
 #ifdef __cplusplus
 }
 #endif

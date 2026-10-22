@@ -389,6 +389,21 @@ static uint32_t s_photosThisAlbum;           /* photos shown since album open */
 static uint8_t s_storyAlbum = 0xFF;          /* album index shown in the rail */
 static bool    s_storyHasStory = false;      /* rail shows a story (vs empty) */
 
+/* Recently shown photos, for 小憶's 「上一張」. The directory iterator only
+ * reads forward, so going back replays this ring; ShowNext first walks
+ * forward through it again before the iterator resumes, so stepping back
+ * and on again shows every photo in its order. */
+#define HIST_LEN            (8)
+typedef struct
+{
+    uint8_t album;                           /* index into s_albums */
+    char    name[64];
+} Shown;
+static Shown   s_hist[HIST_LEN];
+static uint8_t s_histCount;                  /* valid entries */
+static uint8_t s_histHead;                   /* next slot to write */
+static uint8_t s_histBack;                   /* 0 = live, k = k photos back */
+
 static bool str_ieq(const char *a, const char *b)
 {
     for (; *a && *b; a++, b++)
@@ -501,6 +516,71 @@ static int story_follow_album(uint8_t albumIdx)
     return s_storyHasStory ? 0 : -1;
 }
 
+static const Shown *hist_at(uint8_t back)   /* 0 = newest */
+{
+    return &s_hist[(s_histHead + HIST_LEN - 1u - back) % HIST_LEN];
+}
+
+static void hist_push(uint8_t album, const char *name)
+{
+    Shown *h = &s_hist[s_histHead];
+
+    h->album = album;
+    strncpy(h->name, name, sizeof(h->name) - 1);
+    h->name[sizeof(h->name) - 1] = 0;
+    s_histHead = (uint8_t)((s_histHead + 1u) % HIST_LEN);
+    if (s_histCount < HIST_LEN)
+        s_histCount++;
+}
+
+/* Photo region: the panel minus the columns reserved on the right. */
+static void photo_region(uint32_t *w, uint32_t *h)
+{
+    *w = Disaplay_GetLCDWidth();
+    *h = Disaplay_GetLCDHeight();
+    if (s_rightReserve < *w)
+        *w -= s_rightReserve;
+}
+
+/* Decode + blit one photo, caption it, bring the album's story onto the
+ * rail and record it as what is on screen. The caller has checked that
+ * fname is a .jpg/.bmp. */
+static int show_photo(uint8_t albumIdx, const char *fname,
+                      uint32_t panelW, uint32_t panelH)
+{
+    const Album *al = &s_albums[albumIdx];
+    char path[300];
+    int  rc;
+
+    if (al->name[0])
+        snprintf(path, sizeof(path), "%s\\%s\\%s", s_root, al->name, fname);
+    else
+        snprintf(path, sizeof(path), "%s\\%s", s_root, fname);
+
+    rc = name_is_jpg(fname) ? show_jpg(path, panelW, panelH)
+                            : show_bmp(path, panelW, panelH);
+    if (rc != 0)
+        return rc;
+
+#if SLIDE_CAPTION
+    {
+        char caption[96];
+        if (al->name[0])
+            snprintf(caption, sizeof(caption), "%s/%s", al->name, fname);
+        else
+            snprintf(caption, sizeof(caption), "%s", fname);
+        Display_PutText(caption, (uint32_t)strlen(caption),
+                        4, panelH - 20, C_WHITE, C_BLACK, false, 1);
+    }
+#endif
+    /* Photo is up: make the story rail match the album it came from. */
+    story_follow_album(albumIdx);
+
+    strncpy(s_curFolder, al->name, sizeof(s_curFolder) - 1);
+    strncpy(s_curPhoto, fname, sizeof(s_curPhoto) - 1);
+    return 0;
+}
+
 int Slideshow_LibScan(const char *rootPath)
 {
     DIR     dir;
@@ -509,9 +589,12 @@ int Slideshow_LibScan(const char *rootPath)
 
     f_chdrive(drv);
 
-    /* Album indices are about to change; forget what the rail shows. */
+    /* Album indices are about to change; forget what the rail shows and
+     * the photos that were shown. */
     s_storyAlbum    = 0xFF;
     s_storyHasStory = false;
+    s_histCount     = 0;
+    s_histBack      = 0;
 
     strncpy(s_root, rootPath, sizeof(s_root) - 1);
     s_root[sizeof(s_root) - 1] = 0;
@@ -575,14 +658,11 @@ int Slideshow_SetFilter(const char *user)
 
 int Slideshow_ShowNext(void)
 {
-    FILINFO fno;
-
-    uint32_t panelW = Disaplay_GetLCDWidth();
-    uint32_t panelH = Disaplay_GetLCDHeight();
+    FILINFO  fno;
+    uint32_t panelW, panelH;
 
     /* Photos letterbox into the region left of the reserved panel (StoryUI). */
-    if (s_rightReserve < panelW)
-        panelW -= s_rightReserve;
+    photo_region(&panelW, &panelH);
 
     if (s_nAlbums == 0 || s_nMatched == 0)
         return -1;                  /* Slideshow_LibScan not run / failed */
@@ -594,11 +674,21 @@ int Slideshow_ShowNext(void)
         s_albumsDone = 0;
         s_shownInCycle = 0;
         s_restart = false;
+        s_histBack = 0;             /* new play set: no stepping back into it */
 
         /* Clear the photo region so leftovers from the previous play set
          * (larger photo, stale caption) can't linger. */
         S_DISP_RECT r = { 0, 0, panelW - 1u, panelH - 1u };
         Display_ClearRect(C_BLACK, &r);
+    }
+
+    /* Stepped back with 「上一張」: walk forward through what was already
+     * shown before reading new photos. */
+    while (s_histBack > 0)
+    {
+        const Shown *h = hist_at(--s_histBack);
+        if (show_photo(h->album, h->name, panelW, panelH) == 0)
+            return 0;
     }
 
     for (;;)
@@ -666,55 +756,44 @@ int Slideshow_ShowNext(void)
 
         if (fno.fattrib & AM_DIR) continue;
 
-        const Album *al = &s_albums[s_matched[s_cursor]];
-        char path[300];
-        int  rc;
-
-        if (al->name[0])
-            snprintf(path, sizeof(path), "%s\\%s\\%s", s_root, al->name, fno.fname);
-        else
-            snprintf(path, sizeof(path), "%s\\%s", s_root, fno.fname);
-
-        if (name_is_jpg(fno.fname))
-            rc = show_jpg(path, panelW, panelH);
-        else if (name_is_bmp(fno.fname))
-            rc = show_bmp(path, panelW, panelH);
-        else if (name_is_png(fno.fname) || name_is_heic(fno.fname))
+        if (name_is_png(fno.fname) || name_is_heic(fno.fname))
         {
             printf("[SLIDESHOW] skip %s (PNG/HEIC not decodable on-device; "
                    "convert with scripts/prepare_pictures.py)\n", fno.fname);
             continue;
         }
-        else
+        if (!name_is_jpg(fno.fname) && !name_is_bmp(fno.fname))
             continue;   /* not a picture (label.json lands here too) */
 
+        int rc = show_photo(s_matched[s_cursor], fno.fname, panelW, panelH);
         if (rc != 0)
         {
             printf("[SLIDESHOW] skip %s (rc=%d)\n", fno.fname, rc);
             continue;
         }
 
-#if SLIDE_CAPTION
-        {
-            char caption[96];
-            if (al->name[0])
-                snprintf(caption, sizeof(caption), "%s/%s", al->name, fno.fname);
-            else
-                snprintf(caption, sizeof(caption), "%s", fno.fname);
-            Display_PutText(caption, (uint32_t)strlen(caption),
-                            4, panelH - 20, C_WHITE, C_BLACK, false, 1);
-        }
-#endif
-        /* Photo is up: make the story rail match the album it came from. */
-        story_follow_album(s_matched[s_cursor]);
-
-        strncpy(s_curFolder, al->name, sizeof(s_curFolder) - 1);
-        strncpy(s_curPhoto, fno.fname, sizeof(s_curPhoto) - 1);
-
+        hist_push(s_matched[s_cursor], fno.fname);
         s_photosThisAlbum++;
         s_shownInCycle++;
         return 0;
     }
+}
+
+int Slideshow_ShowPrev(void)
+{
+    uint32_t panelW, panelH;
+
+    photo_region(&panelW, &panelH);
+
+    /* The newest entry is the photo on screen (when live), so the one
+     * before it is s_histBack + 1 back. Skip any that no longer decode. */
+    while ((uint32_t)s_histBack + 1u < s_histCount)
+    {
+        const Shown *h = hist_at(++s_histBack);
+        if (show_photo(h->album, h->name, panelW, panelH) == 0)
+            return 0;
+    }
+    return -1;
 }
 
 void Slideshow_GetCurrent(char *folder, int folderCap, char *photo, int photoCap)
@@ -729,6 +808,46 @@ void Slideshow_GetCurrent(char *folder, int folderCap, char *photo, int photoCap
         strncpy(photo, s_curPhoto, (size_t)photoCap - 1);
         photo[photoCap - 1] = '\0';
     }
+}
+
+void Slideshow_RailRefresh(void)
+{
+    s_storyAlbum = 0xFF;          /* story_follow_album redraws next photo */
+}
+
+int Slideshow_JumpToAlbum(const char *folder)
+{
+    uint8_t idx = 0xFF, pos = 0xFF;
+
+    for (uint8_t i = 1; i < s_nAlbums; i++)         /* 0 = loose root files */
+        if (str_ieq(s_albums[i].name, folder)) { idx = i; break; }
+    if (idx == 0xFF)
+        return -1;
+
+    for (uint8_t k = 0; k < s_nMatched; k++)
+        if (s_matched[k] == idx) { pos = k; break; }
+    if (pos == 0xFF)
+    {
+        /* Filtered out for this viewer, but asked for by name: join the
+         * play set; the next lib_apply_filter rebuilds it without. (Room is
+         * guaranteed: an album outside the set means s_nMatched < s_nAlbums.) */
+        pos = s_nMatched;
+        s_matched[s_nMatched++] = idx;
+    }
+
+    if (s_iterOpen)
+    {
+        f_closedir(&s_iterDir);
+        s_iterOpen = false;
+    }
+    s_cursor       = pos;
+    s_albumsDone   = 0;
+    s_shownInCycle = 0;
+    s_restart      = false;       /* a pending reset would undo the jump */
+    s_histBack     = 0;           /* the new album, not a replay, comes next */
+
+    printf("[SLIDESHOW] jump -> album '%s'\n", s_albums[idx].name);
+    return 0;
 }
 
 /*----------------------------------------------------------------------------

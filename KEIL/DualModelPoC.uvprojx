@@ -482,6 +482,16 @@
               <FileType>1</FileType>
               <FilePath>..\..\..\..\Library\StdDriver\src\i2s.c</FilePath>
             </File>
+            <File>
+              <FileName>dmic.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\..\Library\StdDriver\src\dmic.c</FilePath>
+            </File>
+            <File>
+              <FileName>pmc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\..\Library\StdDriver\src\pmc.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -526,6 +536,21 @@
               <FileName>Button.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Button.c</FilePath>
+            </File>
+            <File>
+              <FileName>VoiceRec.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\VoiceRec.c</FilePath>
+            </File>
+            <File>
+              <FileName>VoiceChat.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\VoiceChat.c</FilePath>
+            </File>
+            <File>
+              <FileName>Audio.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Audio.c</FilePath>
             </File>
             <File>
               <FileName>StoryUI.c</FileName>

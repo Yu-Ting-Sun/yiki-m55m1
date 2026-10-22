@@ -4,7 +4,10 @@ litellm
 pillow
 sqlalchemy
 aiosqlite
-edge-tts
+# 7.2.8 started getting 403 from Microsoft's endpoint (2026-10-15): every new
+# TTS failed, so album story audio and 小憶's spoken replies died while only
+# already-cached files kept working. 7.3.1 works.
+edge-tts>=7.3.1
 python-multipart
 httpx
 python-dotenv

@@ -12,8 +12,9 @@
  *
  * Per album: skip whole album when SD VERSION.TXT == manifest version, else
  * download every file and write VERSION.TXT last (torn sync self-heals).
- * STORY.WAV / STORY.TXT are not fetched — no audio path on this board yet
- * and the rail renders the pre-drawn STORY.TIM.
+ * STORY.TXT is not fetched (the rail renders the pre-drawn STORY.TIM), nor
+ * is the 16-bit STORY.WAV — 小憶 reads the story from STORY.ULW instead,
+ * the same audio as 8 kHz mu-law at a quarter of the bytes (Audio.c).
  *
  * Buffers: downloads land in the slideshow HyperRAM frame buffer (idle
  * while a sync runs between photos); the manifest text sits in the tail of
@@ -443,11 +444,22 @@ static int sync_trip(const char *obj, const char *objEnd,
         if (dl_to_file(url, sdPath) != 0) fails++;
     }
 
-    if (get_bool(obj, objEnd, "has_story") &&
-        get_str(obj, objEnd, "story_tim", url, sizeof(url)) == 0)
+    if (get_bool(obj, objEnd, "has_story"))
     {
-        snprintf(sdPath, sizeof(sdPath), "%s\\STORY.TIM", dir);
-        if (dl_to_file(url, sdPath) != 0) fails++;
+        if (get_str(obj, objEnd, "story_tim", url, sizeof(url)) == 0)
+        {
+            snprintf(sdPath, sizeof(sdPath), "%s\\STORY.TIM", dir);
+            if (dl_to_file(url, sdPath) != 0) fails++;
+        }
+
+        /* 小憶 reads the story out loud from this one (Audio.c). 8 kHz
+         * mu-law: ~8 KB per second of speech, a quarter of STORY.WAV,
+         * which matters on an 11.5 KB/s link. */
+        if (get_str(obj, objEnd, "story_ulaw", url, sizeof(url)) == 0)
+        {
+            snprintf(sdPath, sizeof(sdPath), "%s\\STORY.ULW", dir);
+            if (dl_to_file(url, sdPath) != 0) fails++;
+        }
     }
 
     const char *aEnd, *oEnd;
@@ -858,4 +870,16 @@ int SdSync_PostLike(const char *folder, const char *photo, const char *user)
                             body, resp, sizeof(resp));
     printf("[LIKE] POST %s %s -> %d\n", path, body, st);
     return (st == 200) ? 0 : -2;
+}
+
+int SdSync_FrameId(void)
+{
+    return s_wifiUp ? s_frameId : -1;
+}
+
+int SdSync_DownloadToFile(const char *urlPath, const char *sdPath)
+{
+    if (!s_wifiUp)
+        return -1;
+    return dl_to_file(urlPath, sdPath);
 }

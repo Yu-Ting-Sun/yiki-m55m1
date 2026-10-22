@@ -37,6 +37,9 @@
 #include "FaceRecog.hpp"
 #include "GestureLike.hpp"
 #include "Button.h"
+#include "VoiceRec.h"
+#include "VoiceChat.h"
+#include "Audio.h"
 #include "esp_probe.h"
 #include "day2_test.h"
 #include "day3_demo.h"
@@ -162,11 +165,29 @@
  *   (same person or a different one) locks again, while FILTER_CLEAR_MS of
  *   nobody drops the filter back to playing everything.
  *
- * RUN_UNLOCK_BUTTON adds the second, manual way out: a press on the board
- * button (Button.c) forces that re-check straight away, without waiting out
+ * RUN_UNLOCK_BUTTON adds the second, manual way out: a press on BTN1
+ * (Button.c) forces that re-check straight away, without waiting out
  * LOCK_HOLD_MS. */
 #define LOCK_HOLD_MS       (60000)
 #define RUN_UNLOCK_BUTTON  (1)
+
+/* 1 = push-to-talk with 小憶 (VoiceRec.c + VoiceChat.c): hold BTN0 and ask
+ *     about the photo; letting go sends the question, with what the frame is
+ *     showing, to the backend, and 小憶's answer replaces the album story on
+ *     the rail. A quick tap instead listens for VOICE_TAP_MS. The photo she
+ *     answered about stays up for VOICE_REPLY_HOLD_MS, then the slideshow
+ *     and the album story carry on. Needs RUN_SD_SYNC (frame id + Wi-Fi). */
+#define RUN_VOICE_CHAT      (1)
+#define VOICE_TAP_MAX_MS    (600)    /* let go sooner = a tap, not a hold     */
+#define VOICE_TAP_MS        (5000)   /* tap: listen this long                 */
+#define VOICE_TAIL_MS       (300)    /* keep recording after the release, so  */
+                                     /* the last syllable is not clipped      */
+#define VOICE_MIN_MS        (400)    /* shorter = nothing said, don't upload  */
+#define VOICE_REPLY_HOLD_MS (20000)
+#define VOICE_ACTION_READ_MS (5000)  /* answer that comes with a frame action */
+                                     /* (e.g. sync): read it, then act        */
+#define VOICE_PAUSE_MAX_MS  (600000) /* 「停在這張」 holds at most this long, */
+                                     /* so the frame can't stay stuck         */
 
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
@@ -644,8 +665,200 @@ static void LikeGesture_Update(int seen)
         StoryUI_ShowStatus("Like sent <3");
     else
         StoryUI_ShowStatus("Like failed :(");
+    Slideshow_RailRefresh();     /* album story back with the next photo */
 }
 #endif /* RUN_GESTURE_LIKE */
+
+#if RUN_VOICE_CHAT
+/*----------------------------------------------------------------------------
+ * Push-to-talk with 小憶: record while BTN0 is held (or VOICE_TAP_MS after a
+ * tap), upload with what is on screen, answer onto the rail.
+ *--------------------------------------------------------------------------*/
+static bool     s_voiceHeld;    /* BTN0 still down after VOICE_TAP_MAX_MS  */
+static uint32_t s_voiceUpMs;    /* audio time BTN0 was let go; 0 = held    */
+static bool     s_voiceSyncNow; /* 小憶 was asked for new photos: sync at  */
+                                /* the next photo instead of the doorbell   */
+static bool     s_voicePaused;  /* 「停在這張」: no auto-advance; next/prev */
+static uint32_t s_voicePausedMs;/* still work (manual browsing)            */
+
+/* Slideshow held by 「停在這張」? Lifts itself after VOICE_PAUSE_MAX_MS. */
+static bool Voice_Paused(void)
+{
+    if (s_voicePaused &&
+        (GetSystemTick_ms() - s_voicePausedMs) >= VOICE_PAUSE_MAX_MS)
+    {
+        s_voicePaused = false;
+        printf("[VOICE] pause timed out, slideshow resumes\n");
+    }
+    return s_voicePaused;
+}
+
+/* Stop reading on any button press (the press is consumed, not a question). */
+static int Voice_StopRequested(void)
+{
+    return Button_Poll() != 0;
+}
+
+/* Read the story of the album on screen out of the phone jack. The rail
+ * keeps 小憶's answer while she reads. Returns the hold time. */
+static uint32_t Voice_ReadStory(void)
+{
+    char folder[64], path[160];
+
+    Slideshow_GetCurrent(folder, sizeof(folder), NULL, 0);
+    if (folder[0] == '\0')
+        return VOICE_REPLY_HOLD_MS;         /* loose photos: no album story */
+
+    snprintf(path, sizeof(path), "%s\\%s\\STORY.ULW", SLIDESHOW_DIR, folder);
+
+    int rc = Audio_PlayUlawFile(path, Voice_StopRequested);
+    if (rc < 0)
+    {
+        printf("[VOICE] cannot read %s (rc=%d)\n", path, rc);
+        StoryUI_ShowStatus(rc == AUDIO_ERR_FILE ? "NO STORY AUDIO" : "NO SOUND");
+        Slideshow_RailRefresh();
+        return SLIDESHOW_HOLD_MS;
+    }
+    return VOICE_ACTION_READ_MS;
+}
+
+/* 小憶's photo commands (VOICECHAT_ACT_PHOTO). Returns the hold time. */
+static uint32_t Voice_PhotoCommand(const char *cmd)
+{
+    int rc;
+
+    if (strcmp(cmd, "pause") == 0)
+    {
+        s_voicePaused   = true;
+        s_voicePausedMs = GetSystemTick_ms();
+        return VOICE_ACTION_READ_MS;
+    }
+    if (strcmp(cmd, "resume") == 0)
+    {
+        s_voicePaused = false;
+        return VOICE_ACTION_READ_MS;     /* read the answer, then play on */
+    }
+
+    if (strcmp(cmd, "next") == 0)
+        rc = Slideshow_ShowNext();
+    else if (strcmp(cmd, "prev") == 0)
+        rc = Slideshow_ShowPrev();
+    else
+    {
+        printf("[VOICE] unknown photo command '%s'\n", cmd);
+        return VOICE_REPLY_HOLD_MS;
+    }
+
+    if (rc == 0)
+    {
+        /* The new photo painted its album story over the answer. */
+        VoiceChat_RedrawAnswer();
+        Slideshow_RailRefresh();
+    }
+    else
+        printf("[VOICE] photo '%s' not possible (rc=%d)\n", cmd, rc);
+    return VOICE_ACTION_READ_MS;
+}
+
+/* VoiceRec_KeepFn, asked every 10 ms of audio. */
+static int Voice_KeepRecording(uint32_t elapsedMs)
+{
+    if (Button_IsDown(BUTTON_BTN0))
+    {
+        if (elapsedMs >= VOICE_TAP_MAX_MS)
+            s_voiceHeld = true;
+        s_voiceUpMs = 0;
+        return 1;
+    }
+    if (!s_voiceHeld)
+        return elapsedMs < VOICE_TAP_MS;        /* a tap: listen a set while */
+    if (s_voiceUpMs == 0)
+        s_voiceUpMs = elapsedMs;
+    return (elapsedMs - s_voiceUpMs) < VOICE_TAIL_MS;
+}
+
+/* One question, start to finish. Returns how long the photo on screen (and
+ * whatever the rail now says) should stay up. */
+static uint32_t Voice_Ask(void)
+{
+    char     folder[64], photo[64];
+    uint32_t n = 0;
+
+    Slideshow_GetCurrent(folder, sizeof(folder), photo, sizeof(photo));
+#if RUN_FACE_RECOG && !RUN_FACE_ENROLL
+    const char *user = s_filterUser;
+#else
+    const char *user = "";
+#endif
+
+    StoryUI_ShowStatus("LISTENING...");
+    s_voiceHeld = false;
+    s_voiceUpMs = 0;
+    const uint8_t *au = VoiceRec_Capture(VOICEREC_MAX_MS, Voice_KeepRecording, &n);
+
+    /* The rail now belongs to the answer (or the error); the next photo
+     * puts the album story back. */
+    Slideshow_RailRefresh();
+
+    if (n < VOICE_MIN_MS * 8u)                  /* 8 kHz mu-law: 8 B per ms */
+    {
+        StoryUI_ShowStatus("TRY AGAIN");
+        return SLIDESHOW_HOLD_MS;
+    }
+
+    printf("[VOICE] asking about %s/%s, viewer '%s'\n",
+           folder[0] ? folder : "-", photo[0] ? photo : "-",
+           user[0] ? user : "(unknown)");
+    StoryUI_ShowStatus("THINKING...");
+
+    char action[32];
+    int  rc = VoiceChat_Ask(au, n, VoiceRec_RateHz(), folder, photo, user,
+                            action, sizeof(action));
+    if (rc == 0)
+    {
+        /* Say it as well as show it: the rail text is small for the eyes
+         * this frame is for. A button press stops her. */
+        VoiceChat_SpeakAnswer(Voice_StopRequested);
+        if (strcmp(action, VOICECHAT_ACT_SYNC) == 0)
+        {
+            /* Runs at the next photo - which a pause would never reach, and
+             * asking for new photos means wanting to see them anyway. */
+            s_voiceSyncNow = true;
+            s_voicePaused  = false;
+            return VOICE_ACTION_READ_MS;
+        }
+        if (strncmp(action, VOICECHAT_ACT_ALBUM, strlen(VOICECHAT_ACT_ALBUM)) == 0)
+        {
+            const char *want = action + strlen(VOICECHAT_ACT_ALBUM);
+
+            /* Show the album right away; its first photo paints the album
+             * story over the answer, so put the answer back for this photo
+             * (the next one brings the story). */
+            if (Slideshow_JumpToAlbum(want) == 0 && Slideshow_ShowNext() == 0)
+            {
+                VoiceChat_RedrawAnswer();
+                Slideshow_RailRefresh();
+                return VOICE_ACTION_READ_MS;
+            }
+            printf("[VOICE] could not switch to album '%s'\n", want);
+            return VOICE_REPLY_HOLD_MS;
+        }
+        if (strncmp(action, VOICECHAT_ACT_PHOTO, strlen(VOICECHAT_ACT_PHOTO)) == 0)
+            return Voice_PhotoCommand(action + strlen(VOICECHAT_ACT_PHOTO));
+        if (strcmp(action, VOICECHAT_ACT_STORY "read") == 0)
+            return Voice_ReadStory();
+        if (action[0])
+            printf("[VOICE] unknown frame action '%s' ignored\n", action);
+        return VOICE_REPLY_HOLD_MS;
+    }
+
+    printf("[VOICE] no answer (rc=%d)\n", rc);
+    StoryUI_ShowStatus(rc == VOICECHAT_ERR_OFFLINE ? "OFFLINE" : "NO ANSWER");
+    return SLIDESHOW_HOLD_MS;
+}
+#else
+static bool Voice_Paused(void) { return false; }
+#endif /* RUN_VOICE_CHAT */
 
 /*----------------------------------------------------------------------------
  * main
@@ -665,6 +878,17 @@ int main(void)
         printf("[OK] timing source: DWT CYCCNT (cycle-accurate)\n");
     else
         printf("[OK] timing source: SysTick 64-bit (DWT disabled - see PerfTimer.h)\n");
+
+#if RUN_VOICE_CHAT
+    VoiceRec_Init();
+    /* Reading a story out loud needs the codec; a board with nothing in the
+     * phone jack (or no codec) just keeps the frame silent. */
+    Audio_Init();
+#endif
+
+#if RUN_VOICE_CHAT || RUN_UNLOCK_BUTTON
+    Button_Init();        /* BTN0 talk, BTN1 lock release */
+#endif
 
 #if RUN_DAY2_TESTS
     day2_test_run();      /* Wi-Fi + HTTP link validation; never returns */
@@ -713,9 +937,6 @@ int main(void)
             /* Set once when the lock wipes the preview corner, so the wipe
              * happens on the lock edge and not on every idle tick. */
             bool previewCleared = false;
-#endif
-#if RUN_UNLOCK_BUTTON
-            Button_Init();      /* manual unlock while locked */
 #endif
 #endif
             /* Face detection draws boxes onto the frame before it is blitted.
@@ -897,11 +1118,22 @@ int main(void)
                 {
                     static uint32_t s_lastCheckMs = 0;
                     uint32_t now = GetSystemTick_ms();
+                    bool voiceSync = false;
+#if RUN_VOICE_CHAT
+                    voiceSync      = s_voiceSyncNow;
+                    s_voiceSyncNow = false;
+#endif
 
-                    if (now - s_lastCheckMs >= SDSYNC_CHECK_MS)
+                    if (voiceSync || now - s_lastCheckMs >= SDSYNC_CHECK_MS)
                     {
                         s_lastCheckMs = now;
-                        if (SdSync_Poll() > 0)
+
+                        /* Asked out loud: the doorbell is known to be up, so
+                         * sync straight away with progress on the rail. */
+                        int upd = voiceSync ? SdSync_Run(true) : SdSync_Poll();
+                        if (voiceSync)
+                            Slideshow_RailRefresh();
+                        if (upd > 0)
                         {
                             Slideshow_LibScan(SLIDESHOW_DIR);
                             continue;           /* show the new content now */
@@ -911,11 +1143,24 @@ int main(void)
 #endif
 
                 /* Hold window: this idle time is where the camera (and later
-                 * the face-recognition inference) runs. */
-                uint32_t t0 = GetSystemTick_ms();
+                 * the face-recognition inference) runs. A question to 小憶
+                 * stretches it, so the photo she answers about stays up;
+                 * 「停在這張」 holds it until 「繼續播」. */
+                uint32_t t0     = GetSystemTick_ms();
+                uint32_t holdMs = SLIDESHOW_HOLD_MS;
 
-                while ((GetSystemTick_ms() - t0) < SLIDESHOW_HOLD_MS)
+                while ((GetSystemTick_ms() - t0) < holdMs || Voice_Paused())
                 {
+#if RUN_VOICE_CHAT || RUN_UNLOCK_BUTTON
+                    /* One poll per turn, dispatched below: BTN0 talks to 小憶,
+                     * BTN1 drops the recognition lock. */
+                    uint32_t btn = Button_Poll();
+                    (void)btn;
+#endif
+#if RUN_VOICE_CHAT
+                    if (btn & BUTTON_BTN0)
+                        holdMs = (GetSystemTick_ms() - t0) + Voice_Ask();
+#endif
 #if RUN_CAMERA_PREVIEW
                     /* Locked onto a viewer: face recognition pauses (the box
                      * stops flickering red/green) and the preview corner is
@@ -930,7 +1175,7 @@ int main(void)
                     if (locked)
                     {
 #if RUN_UNLOCK_BUTTON
-                        if (Button_Pressed())
+                        if (btn & BUTTON_BTN1)
                             SlideFilter_Unlock();
 #endif
 #if SHOW_CAMERA_PREVIEW

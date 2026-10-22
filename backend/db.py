@@ -122,6 +122,25 @@ class LikeEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
 
 
+class FrameMessage(Base):
+    """長輩對相框說「跟女兒說…」→ 小憶的 leave_message 工具記下來。
+    App 用 GET /frames/{id}/messages?after=<id> 輪詢跳通知，並能播
+    長輩講這句話的原音（voice_id → audio_cache/voice_<id>.wav）。"""
+
+    __tablename__ = "frame_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    frame_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_label: Mapped[str] = mapped_column(String(64), default="")  # 誰留的
+    recipient: Mapped[str] = mapped_column(String(64), default="")   # 給誰（女兒/全家…）
+    text: Mapped[str] = mapped_column(Text, default="")              # 小憶整理的留言
+    voice_id: Mapped[str] = mapped_column(String(16), default="")    # 原音錄音
+    # 留言時相框在播的相簿/照片（「看到這張想到你」）
+    trip_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    photo_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

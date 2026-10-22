@@ -160,6 +160,9 @@ static const nu_pdma_periph_ctl_t g_nu_pdma_peripheral_ctl_pool[ ] =
 {
     // M2M
     { PDMA_MEM, eMemCtl_SrcInc_DstInc },
+    // M2P: story playback feeds the I2S0 TX FIFO (Audio.c). Only the
+    // display used this driver before, so the pool was memory-only.
+    { PDMA_I2S0_TX, eMemCtl_SrcInc_DstFix },
 };
 #define NU_PERIPHERAL_SIZE ( sizeof(g_nu_pdma_peripheral_ctl_pool) / sizeof(g_nu_pdma_peripheral_ctl_pool[0]) )
 

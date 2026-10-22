@@ -69,6 +69,12 @@ int esp_wifi_get_mac(char *mac_out);                      /* AT+CIFSR STAMAC; >=
  *-------------------------------------------------------------------------*/
 int esp_tcp_connect(const char *host, int port);          /* AT+CIPSTART */
 int esp_tcp_send(const char *data, int len);              /* AT+CIPSEND + payload */
+/* Same demux, but ends as soon as the HTTP reply is complete (headers +
+ * Content-Length) instead of waiting for the peer to close — the module
+ * drops what it has not forwarded when the peer's FIN arrives. Pair it with
+ * a "Connection: keep-alive" request and close from this side. */
+int esp_tcp_recv_http(char *buf, int max_len, int timeout_ms);
+
 int esp_tcp_recv(char *buf, int max_len, int timeout_ms); /* +IPD demux; >=0 bytes
                                                              (returns early once the
                                                              peer closes the link) */

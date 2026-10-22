@@ -25,6 +25,10 @@
 #define ESP_UART_IRQ        UART8_IRQn
 #define ESP_RST_PIN         PD2
 
+/* Link speed the driver moves to once the module answers (115200 = stay
+ * put). See at_raise_baud. */
+#define ESP_LINK_BAUD       (460800u)
+
 /* Set 1 to mirror every AT exchange on the debug console (very chatty). */
 #define ESP_AT_TRACE        (0)
 
@@ -218,6 +222,49 @@ static int at_apply_base_config(void)
     return at_cmd("AT+CIPMUX=0\r\n", "OK\r\n", 1000);             /* single conn */
 }
 
+/* Move the link off 115200. At that rate the module takes TCP in far faster
+ * than it can push bytes to us, and when its buffer fills it drops them —
+ * the truncated 37 KB downloads (the MCU's own counters stay at zero). Four
+ * times the drain rate makes that rare, and every transfer four times
+ * quicker. AT+UART_CUR is volatile: a power cycle is back at 115200. */
+static int at_raise_baud(void)
+{
+    char cmd[48];
+
+    if (ESP_LINK_BAUD == 115200)
+        return ESP_OK;
+
+    snprintf(cmd, sizeof(cmd), "AT+UART_CUR=%u,8,1,0,0\r\n",
+             (unsigned)ESP_LINK_BAUD);
+
+    /* The module answers OK at the old rate, then switches. */
+    if (at_cmd(cmd, "OK\r\n", 2000) != ESP_OK)
+    {
+        printf("[ESP] AT+UART_CUR refused; staying at 115200\n");
+        return ESP_ERR_ERROR;
+    }
+
+    ll_burn_ms(50);
+    esp_ll_set_baud(ESP_LINK_BAUD);
+    esp_ll_flush_rx();
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (esp_at_check() == ESP_OK)
+        {
+            printf("[ESP] link now at %u baud\n", (unsigned)ESP_LINK_BAUD);
+            return ESP_OK;
+        }
+    }
+
+    /* It did not follow us up: drop back and carry on slowly. */
+    esp_ll_set_baud(115200);
+    esp_ll_flush_rx();
+    printf("[ESP] module did not follow to %u baud; back to 115200\n",
+           (unsigned)ESP_LINK_BAUD);
+    return ESP_ERR_ERROR;
+}
+
 int esp_at_init(void)
 {
     int rc = ESP_ERR_TIMEOUT;
@@ -231,6 +278,28 @@ int esp_at_init(void)
             break;
     }
 
+    /* Nothing at 115200? The module is not reset when this board reboots, so
+     * after a reflash it is often still at the rate a previous run raised it
+     * to. Listen there before deciding it is wedged. */
+    if (rc != ESP_OK && ESP_LINK_BAUD != 115200)
+    {
+        esp_ll_set_baud(ESP_LINK_BAUD);
+        esp_ll_flush_rx();
+
+        for (i = 0; i < 3; i++)
+        {
+            if ((rc = esp_at_check()) == ESP_OK)
+                break;
+        }
+        if (rc == ESP_OK)
+            printf("[ESP] module was still at %u baud\n", (unsigned)ESP_LINK_BAUD);
+        else
+        {
+            esp_ll_set_baud(115200);
+            esp_ll_flush_rx();
+        }
+    }
+
     if (rc != ESP_OK)                      /* unresponsive: one hard reset try */
     {
         if ((rc = esp_at_reset()) != ESP_OK)
@@ -238,12 +307,26 @@ int esp_at_init(void)
         return ESP_OK;                     /* esp_at_reset re-applied config */
     }
 
-    return at_apply_base_config();
+    if ((rc = at_apply_base_config()) != ESP_OK)
+        return rc;
+
+    at_raise_baud();                       /* nice to have, never fatal */
+    return ESP_OK;
 }
 
 int esp_at_reset(void)
 {
     int rc = at_cmd("AT+RST\r\n", "ready", 5000);
+
+    /* A reset drops the module back to its stored 115200 (AT+UART_CUR is
+     * volatile), so follow it down before listening for "ready". */
+    if (ESP_LINK_BAUD != 115200)
+    {
+        esp_ll_set_baud(115200);
+        esp_ll_flush_rx();
+        if (rc != ESP_OK)
+            rc = at_wait("ready", 5000, s_atResp, AT_RESP_SZ);
+    }
 
     if (rc != ESP_OK)                      /* soft reset failed: yank PD2 */
     {
@@ -261,7 +344,11 @@ int esp_at_reset(void)
         while ((now_ms() - t0) < 300u) { }
     }
 
-    return at_apply_base_config();
+    if ((rc = at_apply_base_config()) != ESP_OK)
+        return rc;
+
+    at_raise_baud();
+    return ESP_OK;
 }
 
 /*---------------------------------------------------------------------------
@@ -389,11 +476,51 @@ int esp_tcp_send(const char *data, int len)
     return at_wait("SEND OK", 5000, s_atResp, AT_RESP_SZ);
 }
 
+/* Value of the Content-Length header inside the bytes received so far, or
+ * -1. Case-insensitive; the header names uvicorn sends are lowercase. */
+static int http_content_length(const char *buf, int len)
+{
+    static const char key[] = "content-length:";
+    const int klen = (int)sizeof(key) - 1;
+
+    for (int i = 0; i + klen <= len; i++)
+    {
+        int j = 0;
+
+        while (j < klen)
+        {
+            char c = buf[i + j];
+
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if (c != key[j]) break;
+            j++;
+        }
+        if (j < klen) continue;
+
+        int v = 0, seen = 0, p = i + klen;
+
+        while (p < len && (buf[p] == ' ' || buf[p] == '\t')) p++;
+        for (; p < len && buf[p] >= '0' && buf[p] <= '9'; p++)
+        {
+            v = v * 10 + (buf[p] - '0');
+            seen = 1;
+        }
+        return seen ? v : -1;
+    }
+    return -1;
+}
+
 /* Demultiplex "+IPD,<len>:<payload>" frames into buf. Returns payload bytes
  * collected (>= 0), ESP_ERR_TIMEOUT if the deadline passed with zero bytes.
- * Ends early once the peer closes the connection ("CLOSED") — which, with
- * "Connection: close" HTTP, is exactly the end-of-response signal. */
-int esp_tcp_recv(char *buf, int max_len, int timeout_ms)
+ * Ends on "CLOSED" (the peer hung up) and, when httpAware, as soon as the
+ * response is complete: headers plus Content-Length bytes.
+ *
+ * Waiting for "CLOSED" is what the Day-2 code did, and it costs data: the
+ * module drops whatever it has not forwarded yet when the peer's FIN lands,
+ * which on this link reliably ate the last TCP segment of 50-60 KB replies
+ * (always the same byte count, always < 1460 B short). Counting the body
+ * instead means we close the connection ourselves, with nothing in flight. */
+static int tcp_recv_impl(char *buf, int max_len, int timeout_ms, int httpAware)
 {
     enum { SCAN, LEN, DATA } st = SCAN;
     const char *tag       = "+IPD,";
@@ -401,6 +528,8 @@ int esp_tcp_recv(char *buf, int max_len, int timeout_ms)
     int  tagPos = 0, closedPos = 0;
     int  frameLeft = 0;
     int  total = 0;
+    int  bodyStart = -1;        /* httpAware: index just past the headers */
+    int  want = -1;             /* httpAware: total bytes that make a reply */
     uint32_t t0 = now_ms();
 
     if (!buf || max_len <= 0)
@@ -462,11 +591,39 @@ int esp_tcp_recv(char *buf, int max_len, int timeout_ms)
 
                 if (total >= max_len)      /* caller buffer full: stop here */
                     return total;
+
+                if (httpAware && want < 0)
+                {
+                    if (bodyStart < 0 && total >= 4 &&
+                        buf[total - 4] == '\r' && buf[total - 3] == '\n' &&
+                        buf[total - 2] == '\r' && buf[total - 1] == '\n')
+                    {
+                        int clen = http_content_length(buf, total);
+
+                        bodyStart = total;
+                        if (clen >= 0)
+                            want = total + clen;
+                    }
+                }
+                else if (httpAware && total >= want)
+                {
+                    return total;          /* whole reply in hand */
+                }
                 break;
         }
     }
 
     return (total > 0) ? total : ESP_ERR_TIMEOUT;
+}
+
+int esp_tcp_recv(char *buf, int max_len, int timeout_ms)
+{
+    return tcp_recv_impl(buf, max_len, timeout_ms, 0);
+}
+
+int esp_tcp_recv_http(char *buf, int max_len, int timeout_ms)
+{
+    return tcp_recv_impl(buf, max_len, timeout_ms, 1);
 }
 
 int esp_tcp_close(void)

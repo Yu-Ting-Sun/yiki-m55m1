@@ -214,6 +214,16 @@ extern "C" int GestureLike_Run(const uint16_t *frameRGB565, int w, int h)
     printf("[GESTURE] hand p=%.2f span=%.0f thumbUp=%d (rise %.0f/%.0f) "
            "below=%d/4\n", presence, span, thumbUp ? 1 : 0,
            wristY - thumbTipY, 0.55f * span, nBelow);
+    /* TEMPORARY: where the model actually puts each fingertip,
+     * as (tipY - thumbTipY) / span. Positive = below the thumb.
+     * Both fist rules built on these have failed on-board, so the
+     * next one gets designed from the numbers, not guessed. */
+    printf("[GESTURE] dy idx=%.2f mid=%.2f rng=%.2f pky=%.2f  rise=%.2f\n",
+           (lm[8 * 3 + 1]  - thumbTipY) / span,
+           (lm[12 * 3 + 1] - thumbTipY) / span,
+           (lm[16 * 3 + 1] - thumbTipY) / span,
+           (lm[20 * 3 + 1] - thumbTipY) / span,
+           (wristY - thumbTipY) / span);
 #endif
 
     return (thumbUp && tipsBelow) ? 1 : 0;

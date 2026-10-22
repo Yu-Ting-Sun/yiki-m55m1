@@ -56,11 +56,35 @@ int Slideshow_SetFilter(const char *user);
 int Slideshow_ShowNext(void);
 
 /**
+ * @brief  Show the photo before the one on screen (小憶's 「上一張」). The last
+ *         8 photos are kept; after stepping back, Slideshow_ShowNext() walks
+ *         forward through them again before any new photo.
+ * @return 0 photo shown; -1 nothing older kept.
+ */
+int Slideshow_ShowPrev(void);
+
+/**
  * @brief  Album folder + photo file currently on screen (for the gesture-like
  *         report). folder "" = root pseudo-album; photo "" = story-only slide.
  *         Either output may be NULL if not wanted.
  */
 void Slideshow_GetCurrent(char *folder, int folderCap, char *photo, int photoCap);
+
+/**
+ * @brief  Someone else drew on the story rail (a status line, 小憶's answer):
+ *         the next Slideshow_ShowNext() puts the album's story back, even if
+ *         the album has not changed. Until then the rail is left alone.
+ */
+void Slideshow_RailRefresh(void);
+
+/**
+ * @brief  Play album `folder` (e.g. "T0016") from its first photo at the next
+ *         Slideshow_ShowNext(), then carry on through the play set as usual.
+ *         An album the viewer filter left out joins the play set until the
+ *         filter next changes — it was asked for by name (小憶).
+ * @return 0 ok; -1 no such album on the card (not synced yet?).
+ */
+int Slideshow_JumpToAlbum(const char *folder);
 
 /**
  * @brief  Convenience wrapper: Slideshow_LibScan + ShowNext/Delay forever.

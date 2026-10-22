@@ -21,6 +21,10 @@
 #                                      see textimg.py; ready as soon as
 #                                      /generate returns)
 #   GET  /textimg/{audio_id}/preview-> same strip as PNG (browser check)
+#   POST /frames/{id}/voice         -> push-to-talk with 小憶: 8 kHz mu-law in,
+#                                      reply as a story-rail TIM4 out
+#   GET  /frames/{id}/messages      -> messages the elder left through 小憶
+#                                      (App polls; .../{mid}/audio = the voice)
 #
 # Environment (LLM routing details at the LLM_MODEL block below):
 #   LLM_MODEL       model name, default gemini-3-flash (provider auto-prefixed)
@@ -46,7 +50,7 @@ from pathlib import Path
 import httpx
 import litellm  # heavy import (~10 s); pay it at startup, not on first /generate
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from pydantic import BaseModel
@@ -54,8 +58,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 
 import db
-from db import Frame, GpsPoint, LikeEvent, Photo, Trip, TripSpot
-from textimg import render_story_tim4
+from db import Frame, FrameMessage, GpsPoint, LikeEvent, Photo, Trip, TripSpot
+from textimg import render_reply_tim4, render_story_tim4
 
 # 從 backend/.env 載入環境變數（若存在）——必須在下面所有 os.environ.get(...)
 # 之前跑。shell 已設的變數優先（override=False），不會被 .env 蓋掉。
@@ -1098,6 +1102,44 @@ async def trip_story_wav(trip_id: int):
     return FileResponse(f, media_type="audio/wav", filename=f"t{trip_id}.wav")
 
 
+@app.get("/trips/{trip_id}/story.ulaw")
+async def trip_story_ulaw(trip_id: int):
+    """遊記語音給相框用的格式：8 kHz G.711 mu-law，沒有檔頭。
+
+    板子的 Wi-Fi 模組只有約 11.5 KB/s，16-bit WAV 一趟遊記要傳快一分鐘；
+    mu-law 是四分之一大小（8 KB/s），板端解碼只是查表（Audio.c），音質
+    對語音夠用。內容同 story.wav，所以沿用它的 TTS 快取。"""
+    trip, _, _ = await _load_trip_story(trip_id)
+    wav = MEDIA_DIR / f"t{trip_id}_{_story_hash(trip.story_text)}.wav"
+    ulaw = wav.with_suffix(".ulaw")
+
+    if not ulaw.exists():
+        async with _MEDIA_LOCK:
+            if not wav.exists():
+                try:
+                    await tts_to_wav(trip.story_text, wav)
+                except Exception as e:  # noqa: BLE001
+                    raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
+            if not ulaw.exists():
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", str(wav),
+                    "-ar", "8000", "-ac", "1", "-f", "mulaw", str(ulaw),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    ulaw.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=500,
+                        detail="mu-law encode failed: "
+                               f"{stderr.decode(errors='replace')[-300:]}")
+                print(f"[media] trip {trip_id} ulaw ready: "
+                      f"{ulaw.stat().st_size} bytes")
+    return FileResponse(ulaw, media_type="application/octet-stream",
+                        filename=f"t{trip_id}.ulaw")
+
+
 @app.get("/trips/{trip_id}/label.json")
 async def trip_label_json(trip_id: int):
     """相簿參加者標籤——板端 Slideshow 的 naive parser 讀這個檔決定
@@ -2034,18 +2076,26 @@ _WMO = {0: "晴朗", 1: "大致晴朗", 2: "多雲時晴", 3: "陰天", 45: "起
         95: "雷雨", 96: "雷雨帶冰雹", 99: "強雷雨帶冰雹"}
 
 
-async def _tool_query_my_trips(args: dict) -> dict:
+async def _tool_query_my_trips(args: dict, frame_id: int | None = None) -> dict:
+    """frame_id: asked from a photo frame — only the trips that frame shows,
+    and each with a story excerpt (the frame has no screen to open a trip on,
+    so 小憶 answers "那次做了什麼？" from the text)."""
     limit = max(1, min(int(args.get("limit") or 5), 10))
     member = str(args.get("member") or "").strip().lower()
     keyword = str(args.get("keyword") or "").strip()
 
+    stmt = (select(Trip).options(selectinload(Trip.photos))
+            .order_by(Trip.created_at.desc()))
+    if frame_id is not None:
+        stmt = stmt.where(_frame_trip_filter(frame_id))
     async with db.SessionLocal() as session:
-        trips = (
-            (await session.execute(
-                select(Trip).options(selectinload(Trip.photos))
-                .order_by(Trip.created_at.desc())
-            )).scalars().all()
-        )
+        trips = (await session.execute(stmt)).scalars().all()
+    if frame_id is not None:
+        # "上一次去哪？" means the latest trip DATE: trips imported later than
+        # they happened would otherwise come first (seen: a July trip created
+        # after an August one was answered as "the last trip").
+        trips = sorted(trips, key=lambda t: t.start_time or t.created_at,
+                       reverse=True)
 
     total_m = sum(t.distance_m for t in trips)
     rows = []
@@ -2057,14 +2107,17 @@ async def _tool_query_my_trips(args: dict) -> dict:
             continue
         when = t.start_time or t.created_at
         local = when.replace(tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
-        rows.append({
+        row = {
             "title": t.title or "未命名旅程",
             "date": f"{local.year}-{local.month:02d}-{local.day:02d}",
             "distance_m": int(t.distance_m),
             "photos": len(t.photos),
             "members": members,
             "has_story": bool(t.story_text),
-        })
+        }
+        if frame_id is not None and t.story_text:
+            row["story"] = t.story_text[:120]
+        rows.append(row)
         if len(rows) >= limit:
             break
     return {"total_trips": len(trips),
@@ -2574,45 +2627,50 @@ async def pair_frame(req: PairRequest):
 
 
 def _trip_version(trip: Trip) -> str:
-    """一趟旅程的同步版本號。鹽值 v3：TIM 快取 key 修正前（只 hash 內文）
-    改標題會讓舊圖以新版本號寫進卡裡——升鹽值讓板子整批重抓一次。"""
+    """一趟旅程的同步版本號。鹽值 v4：相簿多了 STORY.ULW（小憶念遊記用的
+    音檔），既有相簿的版本號不會因此改變、就不會去抓新檔案——升鹽值讓板子
+    整批重抓一次。（v3 是 TIM 快取 key 修正。）"""
     return hashlib.md5(
-        ("v3|" + trip.story_text + "|" + trip.title + "|"
+        ("v4|" + trip.story_text + "|" + trip.title + "|"
          + ",".join(str(ph.id) for ph in trip.photos) + "|"
          + ",".join(trip_members(trip))).encode("utf-8")
     ).hexdigest()[:8]
+
+
+async def _frame_pending_count(session, frame: Frame) -> int:
+    """「待同步」= 版本跟上次發給板子的快照不一樣的旅程（含新旅程），
+    加上快照裡有、現在已不存在的旅程（App 刪除 → 板子要撤下相簿）。"""
+    trips = (
+        (await session.execute(
+            select(Trip)
+            .where(_frame_trip_filter(frame.id))
+            .options(selectinload(Trip.photos))
+            .order_by(Trip.created_at.desc())
+        )).scalars().all()
+    )
+    with_content = [t for t in trips if t.story_text or t.photos]
+    try:
+        synced = json.loads(frame.synced_versions or "{}")
+    except ValueError:
+        synced = {}
+    current = {
+        f"T{t.id:04d}": _trip_version(t)
+        for t in with_content[:FRAME_MAX_ALBUMS]
+    }
+    pending = sum(
+        1 for folder, ver in current.items()
+        if synced.get(folder) != ver
+    )
+    pending += sum(1 for folder in synced if folder not in current)
+    return pending
 
 
 @app.get("/frames/{frame_id}")
 async def frame_status(frame_id: int):
     async with db.SessionLocal() as session:
         frame = await get_frame_or_404(session, frame_id)
-        trips = (
-            (await session.execute(
-                select(Trip)
-                .where(_frame_trip_filter(frame_id))
-                .options(selectinload(Trip.photos))
-                .order_by(Trip.created_at.desc())
-            )).scalars().all()
-        )
-        # 「待同步」= 版本跟上次發給板子的快照不一樣的旅程（含新旅程），
-        # 加上快照裡有、現在已不存在的旅程（App 刪除 → 板子要撤下相簿）。
-        with_content = [t for t in trips if t.story_text or t.photos]
-        try:
-            synced = json.loads(frame.synced_versions or "{}")
-        except ValueError:
-            synced = {}
-        current = {
-            f"T{t.id:04d}": _trip_version(t)
-            for t in with_content[:FRAME_MAX_ALBUMS]
-        }
-        pending = sum(
-            1 for folder, ver in current.items()
-            if synced.get(folder) != ver
-        )
-        pending += sum(1 for folder in synced if folder not in current)
         data = frame_json(frame, await _trip_count(session, frame_id))
-        data["pending_count"] = pending
+        data["pending_count"] = await _frame_pending_count(session, frame)
         return data
 
 
@@ -2667,6 +2725,8 @@ async def frame_sync(frame_id: int):
                 "story_txt": f"/trips/{trip.id}/story.txt" if has_story else None,
                 "story_tim": f"/trips/{trip.id}/story.tim" if has_story else None,
                 "story_wav": f"/trips/{trip.id}/story.wav" if has_story else None,
+                # 相框念遊記用的音檔（8 kHz mu-law，見 /trips/{id}/story.ulaw）
+                "story_ulaw": f"/trips/{trip.id}/story.ulaw" if has_story else None,
                 "photos": [
                     {"name": f"P{ph.id:04d}.JPG", "url": f"/photos/{ph.id}/board"}
                     for ph in trip.photos
@@ -2717,28 +2777,42 @@ class LikeIn(BaseModel):
     user: str = ""       # 人臉辨識 label（"" = 沒認出）
 
 
-@app.post("/frames/{frame_id}/like")
-async def frame_like(frame_id: int, body: LikeIn):
+def _like_ids(folder: str, photo: str) -> tuple[int | None, int | None]:
+    """Board names -> (trip_id, photo_id): "T0006" -> 6, "P0012.JPG" -> 12."""
     trip_id = photo_id = None
-    m = re.fullmatch(r"T(\d{1,8})", body.folder.strip())
+    m = re.fullmatch(r"T(\d{1,8})", folder.strip())
     if m:
         trip_id = int(m.group(1))
-    m = re.fullmatch(r"P(\d{1,8})\.JPG", body.photo.strip(), re.IGNORECASE)
+    m = re.fullmatch(r"P(\d{1,8})\.JPG", photo.strip(), re.IGNORECASE)
     if m:
         photo_id = int(m.group(1))
+    return trip_id, photo_id
 
+
+async def _record_like(session, frame_id: int, folder: str, photo: str,
+                       user: str) -> LikeEvent:
+    """One like, however it was given (thumbs-up gesture or said to 小憶);
+    the App polls /likes and notifies the family either way."""
+    trip_id, photo_id = _like_ids(folder, photo)
+    ev = LikeEvent(
+        frame_id=frame_id,
+        trip_id=trip_id,
+        photo_id=photo_id,
+        user_label=user.strip()[:64],
+    )
+    session.add(ev)
+    await session.commit()
+    print(f"[like] frame {frame_id}: '{user or '?'}' liked "
+          f"{folder or '-'}/{photo or '-'}")
+    return ev
+
+
+@app.post("/frames/{frame_id}/like")
+async def frame_like(frame_id: int, body: LikeIn):
     async with db.SessionLocal() as session:
         await get_frame_or_404(session, frame_id)
-        ev = LikeEvent(
-            frame_id=frame_id,
-            trip_id=trip_id,
-            photo_id=photo_id,
-            user_label=body.user.strip()[:64],
-        )
-        session.add(ev)
-        await session.commit()
-        print(f"[like] frame {frame_id}: '{body.user or '?'}' liked "
-              f"{body.folder or '-'}/{body.photo or '-'}")
+        ev = await _record_like(session, frame_id, body.folder, body.photo,
+                                body.user)
         return {"ok": True, "like_id": ev.id}
 
 
@@ -2770,6 +2844,773 @@ async def frame_likes(frame_id: int, after: int = 0, limit: int = 20):
             })
         return {"likes": likes,
                 "last_id": likes[-1]["id"] if likes else after}
+
+
+# ---------------------------------------------------------------------------
+# 長輩留言：對相框說「跟女兒說…」→ 小憶的 leave_message 工具存進
+# frame_messages；App 輪詢新留言跳通知，也能聽長輩講這句話的原音。
+# ---------------------------------------------------------------------------
+
+@app.get("/frames/{frame_id}/messages")
+async def frame_messages(frame_id: int, after: int = 0, limit: int = 20,
+                         newest: bool = False):
+    """App 輪詢用：id > after 的留言（舊到新）。newest=true 改回傳最近
+    limit 則（新到舊），給留言列表用。"""
+    limit = max(1, min(limit, 50))
+    async with db.SessionLocal() as session:
+        stmt = select(FrameMessage).where(FrameMessage.frame_id == frame_id)
+        if newest:
+            stmt = stmt.order_by(FrameMessage.id.desc())
+        else:
+            stmt = stmt.where(FrameMessage.id > after).order_by(FrameMessage.id.asc())
+        rows = (await session.execute(stmt.limit(limit))).scalars().all()
+
+        messages = []
+        for m in rows:
+            title = None
+            if m.trip_id is not None:
+                trip = await session.get(Trip, m.trip_id)
+                title = (trip.title or "未命名旅程") if trip else None
+            messages.append({
+                "id": m.id,
+                "user": m.user_label,
+                "to": m.recipient,
+                "text": m.text,
+                "has_audio": bool(m.voice_id)
+                and (AUDIO_DIR / f"voice_{m.voice_id}.wav").exists(),
+                "trip_id": m.trip_id,
+                "photo_id": m.photo_id,
+                "trip_title": title,
+                "created_at": db.iso_z(m.created_at),
+            })
+        last_id = max((m["id"] for m in messages), default=after)
+        return {"messages": messages, "last_id": last_id}
+
+
+@app.get("/trips/{trip_id}/messages")
+async def trip_messages(trip_id: int, limit: int = 20):
+    """這趟旅程的相框留言（新到舊）：長輩看著這本相簿留的話，就掛在這趟
+    的詳情頁上。原音端點要 frame_id，所以一起回傳。"""
+    limit = max(1, min(limit, 50))
+    async with db.SessionLocal() as session:
+        rows = (await session.execute(
+            select(FrameMessage)
+            .where(FrameMessage.trip_id == trip_id)
+            .order_by(FrameMessage.id.desc())
+            .limit(limit)
+        )).scalars().all()
+    return {"messages": [{
+        "id": m.id,
+        "frame_id": m.frame_id,
+        "user": m.user_label,
+        "to": m.recipient,
+        "text": m.text,
+        "has_audio": bool(m.voice_id)
+        and (AUDIO_DIR / f"voice_{m.voice_id}.wav").exists(),
+        "photo_id": m.photo_id,
+        "created_at": db.iso_z(m.created_at),
+    } for m in rows]}
+
+
+@app.get("/frames/{frame_id}/messages/{message_id}/audio")
+async def frame_message_audio(frame_id: int, message_id: int):
+    """長輩講這則留言的原音，轉成手機好播的 MP3。
+
+    相框錄的 WAV 不能直接給：取樣率是 DMIC 除得出來的 ~8263 Hz（有些手機
+    播放器不收），而且板載麥克風很小聲（實測平均 -57 dB、峰值 -28 dB）。
+    這裡高通去低頻雜訊 + EBU R128 音量正規化 + 16 kHz MP3，快取一份。"""
+    async with db.SessionLocal() as session:
+        m = await session.get(FrameMessage, message_id)
+    if m is None or m.frame_id != frame_id or not m.voice_id:
+        raise HTTPException(status_code=404, detail="unknown message")
+    wav = AUDIO_DIR / f"voice_{m.voice_id}.wav"
+    mp3 = AUDIO_DIR / f"voice_{m.voice_id}.mp3"
+    if not mp3.exists():
+        if not wav.exists():
+            raise HTTPException(status_code=404, detail="recording no longer kept")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(wav),
+            "-af", "highpass=f=120,loudnorm=I=-18:TP=-2:LRA=11",
+            "-ar", "16000", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "48k",
+            str(mp3),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            mp3.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"transcode failed: {stderr.decode(errors='replace')[-300:]}")
+    return FileResponse(mp3, media_type="audio/mpeg")
+
+
+# ---------------------------------------------------------------------------
+# 語音問小憶：長輩按住相框 BTN0 講話 → 板子錄 8 kHz μ-law → POST 到這裡。
+# 聽寫和回答是同一次 LLM 呼叫（Gemini 直接吃音訊），附上相框當下的情境
+# （播到哪本相簿、哪張照片、認出誰）與那張照片本身；回覆畫成故事欄的
+# TIM4 直接回傳，板子一次往返就能上畫面。
+# ---------------------------------------------------------------------------
+
+VOICE_MAX_BYTES = 16 * 8000     # 16 s of 8 kHz mu-law, far past what the board sends
+VOICE_HISTORY_TURNS = 3         # follow-ups ("那是什麼時候？") need the last few turns
+VOICE_HISTORY_TTL_S = 180       # three quiet minutes = a new conversation
+
+# frame_id -> {"t": last activity, "turns": [(question, reply), ...]}
+VOICE_HISTORY: dict[int, dict] = {}
+
+# The rail font (Microsoft JhengHei) has no emoji: they would render as boxes.
+_NO_GLYPH_RE = re.compile("[\U00010000-\U0010FFFF\U00002600-\U000027BF\U0000FE0F\U0000200D]")
+
+VOICE_PERSONA = (
+    "你是智慧相框「憶起」裡的精靈「小憶」，陪家裡的長輩看家人旅遊的照片。"
+    "個性溫暖、口語、有耐心，講繁體中文。\n"
+    "使用者剛按著相框的按鈕對你說了一段話（附上錄音）。"
+    "先把他說的話聽寫下來，再回答他。\n"
+    "規則：\n"
+    "1. 回答要短：最多 45 個字、一到兩句——會顯示在相框側邊的窄欄上。\n"
+    "2. 事實（地點、日期、人物）只能根據相框資料、照片畫面和工具查到的資料；"
+    "都沒有的就老實說不確定，可以改聊照片裡看得到的東西。\n"
+    "3. 錄音裡沒人說話或聽不清楚時，transcript 給空字串，reply 請他再說一次。\n"
+    "4. 不要表情符號、不要引號、不要條列。\n"
+)
+
+# Fallback when the tool loop fails: one plain call, JSON out.
+VOICE_SYSTEM_JSON = (
+    VOICE_PERSONA
+    + '只輸出 JSON：{"transcript": "聽到的原話（繁體中文）", "reply": "小憶的回答"}'
+)
+
+VOICE_SYSTEM_TOOLS = (
+    VOICE_PERSONA
+    + "5. 問眼前這張照片或這本相簿的事，相框資料已經夠了，直接 respond，"
+    "不要呼叫查詢工具（每多呼叫一次，長輩就要多等好幾秒）。"
+    "只有問題超出這本相簿時（去過哪些地方、上次旅程、跟誰去…）才呼叫工具查；"
+    "同一個工具不要用一樣的參數重複呼叫。\n"
+    "6. 完成時「必須」呼叫 respond 收尾：transcript 填他這次說的原話，"
+    "reply 填你的回答。\n"
+    "7. 只能說你「真的做了」的事。按讚、換相簿、換照片、留言給家人、念遊記，"
+    "都要先呼叫對應的工具才算數；沒呼叫工具，就不要在回覆裡說你做了或會去做。"
+    "長輩說「我喜歡這張」就是要按讚，要按就呼叫 like_photo，"
+    "不按就不要說你會告訴家人。\n"
+)
+
+# 相框版小憶的工具（App 版見 GUIDE_TOOLS）。一個一個加：每個工具在
+# _voice_agent 的分派裡有對應的一支 _tool_*。
+VOICE_TOOLS = [
+    {"type": "function", "function": {
+        "name": "query_my_trips",
+        "description": "查這台相框裡家人的旅程回憶（真實資料：日期、距離、照片數、"
+                       "參加者、遊記摘要）。問到去過哪裡、上次旅程、跟誰去、"
+                       "走了多遠等「不只眼前這張照片」的問題時用。",
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "回傳最近幾趟（預設 5，最多 10）"},
+            "member": {"type": "string",
+                       "description": "只看某位參加者的旅程（人臉辨識的名字，例：user1）"},
+            "keyword": {"type": "string", "description": "標題關鍵字過濾（例：日月潭）"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "sync_frame",
+        "description": "檢查家人有沒有新的旅程照片或遊記，並讓相框馬上下載更新。"
+                       "問有沒有新照片、要更新或同步相框時用。",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "like_photo",
+        "description": "幫長輩對「眼前這張照片」按讚，家人的 App 會收到通知（跟對相框比讚一樣）。"
+                       "他說喜歡這張、要按讚、想讓家人知道他喜歡時用；"
+                       "只是在聊照片內容就不要按。",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "show_album",
+        "description": "讓相框馬上換到某一本相簿播放（例：給我看台北的照片、我想看日月潭那次）。"
+                       "用地點／標題／景點關鍵字或參加者找相簿，不用先查旅程；"
+                       "找不到會回報相框裡有哪些相簿。",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string",
+                        "description": "地點、相簿標題或景點的關鍵字，只填詞本身（例：台北、日月潭）"},
+            "member": {"type": "string",
+                       "description": "想看誰的照片（人臉辨識的名字，例：user1）"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "control_slideshow",
+        "description": "控制相框輪播：下一張、上一張、停在這張（暫停自動換）、繼續播。",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string",
+                        "enum": ["next", "previous", "pause", "resume"],
+                        "description": "next=下一張, previous=上一張, "
+                                       "pause=停在這張, resume=繼續播"}},
+            "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "read_story",
+        "description": "把這本相簿的遊記用相框的喇叭念給長輩聽（念的是遊記全文，不是你的回覆）。"
+                       "他說念給我聽、唸一下這趟的故事、字太小看不清楚時用。",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "leave_message",
+        "description": "幫長輩留話給家人（例：跟女兒說我很想她、告訴大家週末回來吃飯）。"
+                       "家人的 App 會跳通知，也能聽到長輩講這句話的原音。",
+        "parameters": {"type": "object", "properties": {
+            "to": {"type": "string",
+                   "description": "給誰，用長輩的稱呼（例：女兒、孫子、全家）；沒說就填「家人」"},
+            "message": {"type": "string",
+                        "description": "要轉達的話，用長輩的口吻、第一人稱，"
+                                       "保留他的意思不要加油添醋（例：我很想妳，有空回來吃飯）"}},
+            "required": ["to", "message"]}}},
+    {"type": "function", "function": {
+        "name": "respond",
+        "description": "給長輩最終回覆並收尾。每次都「必須」呼叫這個工具結束。",
+        "parameters": {"type": "object", "properties": {
+            "transcript": {"type": "string",
+                           "description": "他這次錄音說的原話（繁體中文聽寫）；"
+                                          "沒人說話或聽不清楚給空字串"},
+            "reply": {"type": "string",
+                      "description": "小憶的回答，最多 45 個字、一到兩句"}},
+            "required": ["transcript", "reply"]}}},
+]
+VOICE_AGENT_STEPS = 4           # tool rounds + the respond; each is one LLM call
+
+
+def _ulaw_decode_table() -> list[int]:
+    """G.711 mu-law byte -> PCM16, the inverse of the board's mulaw_encode."""
+    table = []
+    for b in range(256):
+        u = ~b & 0xFF
+        mag = ((((u & 0x0F) << 3) + 0x84) << ((u >> 4) & 0x07)) - 0x84
+        table.append(-mag if u & 0x80 else mag)
+    return table
+
+
+_ULAW_TO_PCM = _ulaw_decode_table()
+
+
+def ulaw_to_wav(data: bytes, rate: int) -> bytes:
+    """8-bit mu-law -> 16-bit mono WAV at the rate the board really sampled
+    (its DMIC runs off APLL1, so e.g. 8263 Hz rather than 8000)."""
+    import io
+    import wave
+    from array import array
+
+    pcm = array("h", (_ULAW_TO_PCM[b] for b in data))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+async def _voice_context(session, folder: str, photo: str,
+                         user: str) -> tuple[str, Path | None]:
+    """What the frame is showing: prompt lines + the photo file on screen."""
+    lines: list[str] = []
+    image_path = None
+
+    m = re.fullmatch(r"T(\d{1,8})", folder.strip())
+    trip = await session.get(Trip, int(m.group(1))) if m else None
+    if trip is not None:
+        lines.append(f"正在播的相簿：{trip.title or '未命名旅程'}")
+        if trip.start_time:
+            local = trip.start_time.replace(tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
+            lines.append(f"旅程日期：{local.year}年{local.month}月{local.day}日")
+        members = trip_members(trip)
+        if members:
+            lines.append("同行的人：" + "、".join(members))
+        spots = (await session.execute(
+            select(TripSpot.name).where(TripSpot.trip_id == trip.id)
+        )).scalars().all()
+        if spots:
+            lines.append("這趟收藏的景點：" + "、".join(spots[:8]))
+        if trip.story_text:
+            lines.append(f"這趟的遊記：{trip.story_text}")
+
+    m = re.fullmatch(r"P(\d{1,8})\.JPG", photo.strip(), re.IGNORECASE)
+    ph = await session.get(Photo, int(m.group(1))) if m else None
+    if ph is not None:
+        if ph.timestamp:
+            local = ph.timestamp.replace(tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
+            lines.append(f"螢幕上這張照片拍攝於：{local.year}年{local.month}月"
+                         f"{local.day}日 {local:%H:%M}")
+        path = PHOTO_DIR / ph.filename
+        if path.exists():
+            image_path = path
+            lines.append("螢幕上這張照片附在後面。")
+    elif trip is not None and not photo.strip():
+        lines.append("螢幕上現在是這趟的遊記畫面，不是照片。")
+
+    if user.strip():
+        lines.append(f"人臉辨識認出正在看相框的是：{user.strip()}")
+    if not lines:
+        lines.append("（相框沒有提供目前畫面的資料）")
+    return "\n".join(lines), image_path
+
+
+def _voice_turns(frame_id: int) -> list[tuple[str, str]]:
+    h = VOICE_HISTORY.get(frame_id)
+    if not h or time.time() - h["t"] > VOICE_HISTORY_TTL_S:
+        return []
+    return list(h["turns"])
+
+
+def _voice_remember(frame_id: int, question: str, reply: str) -> None:
+    turns = _voice_turns(frame_id) + [(question, reply)]
+    VOICE_HISTORY[frame_id] = {"t": time.time(),
+                               "turns": turns[-VOICE_HISTORY_TURNS:]}
+
+
+def _voice_llm_extra() -> dict:
+    """Routing kwargs for litellm — same env as llm_json / the App guide."""
+    key_vars = required_api_keys(LLM_MODEL)
+    if not any(os.environ.get(k) for k in key_vars):
+        raise RuntimeError(f"none of {key_vars} is set for model {LLM_MODEL}")
+    extra = {}
+    if LLM_API_BASE:
+        extra["api_base"] = LLM_API_BASE
+    if os.environ.get("LLM_API_KEY"):
+        extra["api_key"] = os.environ["LLM_API_KEY"]
+    if LLM_REASONING_EFFORT:
+        extra["reasoning_effort"] = LLM_REASONING_EFFORT
+        extra["allowed_openai_params"] = ["reasoning_effort"]
+    return extra
+
+
+def _voice_messages(system: str, context: str, image_uri: str | None,
+                    wav: bytes, turns: list[tuple[str, str]]) -> list[dict]:
+    """System prompt, the last few turns as text, then this question: frame
+    context + the photo on screen + the recording."""
+    import base64
+
+    messages: list[dict] = [{"role": "system", "content": system}]
+    for q, a in turns:
+        messages.append({"role": "user", "content": q})
+        messages.append({"role": "assistant", "content": a})
+    content: list[dict] = [{"type": "text", "text": "相框資料：\n" + context}]
+    if image_uri:
+        content.append({"type": "image_url", "image_url": {"url": image_uri}})
+    content.append({"type": "input_audio", "input_audio": {
+        "data": base64.b64encode(wav).decode(), "format": "wav"}})
+    messages.append({"role": "user", "content": content})
+    return messages
+
+
+def _voice_llm_step(messages: list[dict]):
+    """One agent step (tools offered). Returns the assistant message."""
+    resp = litellm.completion(
+        model=LLM_MODEL,
+        messages=messages,
+        tools=VOICE_TOOLS,
+        tool_choice="auto",
+        temperature=0.7,
+        timeout=40,
+        **_voice_llm_extra(),
+    )
+    return resp.choices[0].message
+
+
+async def _voice_tool_sync(frame_id: int, state: dict) -> dict:
+    """Doorbell up (as the App's 「立即同步」) AND tell the board right away via
+    X-Frame-Action, so it syncs as soon as 小憶 has answered instead of after
+    the reply hold plus a doorbell interval. The flag alone still works for a
+    board that ignores the header."""
+    async with db.SessionLocal() as session:
+        frame = await get_frame_or_404(session, frame_id)
+        pending = await _frame_pending_count(session, frame)
+        frame.sync_requested = 1
+        await session.commit()
+    state["action"] = "sync"
+    print(f"[voice] frame {frame_id}: sync requested ({pending} album(s) pending)")
+    return {"ok": True, "new_or_changed_albums": pending,
+            "note": ("相框回答完就會開始下載" if pending
+                     else "目前沒有新的相簿，相框還是會再檢查一次")}
+
+
+VOICE_LIKE_DEDUP_S = 300       # "我喜歡這張" said twice = one like, one notification
+
+
+async def _voice_tool_like(frame_id: int, screen: dict) -> dict:
+    """Like the photo on screen — the same record the thumbs-up gesture makes,
+    so the family's App notifies the same way. A repeat by the same viewer
+    within VOICE_LIKE_DEDUP_S is not recorded again."""
+    folder, photo, user = screen["folder"], screen["photo"], screen["user"]
+    trip_id, photo_id = _like_ids(folder, photo)
+    if trip_id is None and photo_id is None:
+        return {"error": "相框現在播的不是家人的旅程相簿，沒辦法按讚"}
+
+    since = db.utcnow() - timedelta(seconds=VOICE_LIKE_DEDUP_S)
+    async with db.SessionLocal() as session:
+        dup = (await session.execute(
+            select(LikeEvent.id).where(
+                LikeEvent.frame_id == frame_id,
+                LikeEvent.trip_id.is_(None) if trip_id is None
+                else LikeEvent.trip_id == trip_id,
+                LikeEvent.photo_id.is_(None) if photo_id is None
+                else LikeEvent.photo_id == photo_id,
+                LikeEvent.user_label == user.strip()[:64],
+                LikeEvent.created_at >= since,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if dup is not None:
+            return {"ok": True, "already_liked": True,
+                    "note": "剛剛已經按過讚了，家人已經收到"}
+        await _record_like(session, frame_id, folder, photo, user)
+    return {"ok": True, "note": "已按讚，家人的 App 會收到通知"}
+
+
+async def _voice_tool_show_album(frame_id: int, args: dict, state: dict) -> dict:
+    """Pick one album the card really has — the folders of the last sync
+    manifest — by keyword (title, story or saved spot) and/or member, newest
+    trip first. The board jumps to it (X-Frame-Action: album=T0016)."""
+    keyword = str(args.get("keyword") or "").strip()
+    member = str(args.get("member") or "").strip().lower()
+    if not keyword and not member:
+        return {"error": "需要相簿的地點／標題關鍵字或人名"}
+
+    async with db.SessionLocal() as session:
+        frame = await get_frame_or_404(session, frame_id)
+        try:
+            on_card = set(json.loads(frame.synced_versions or "{}"))
+        except ValueError:
+            on_card = set()
+        trips = (await session.execute(
+            select(Trip).where(_frame_trip_filter(frame_id))
+            .options(selectinload(Trip.photos))
+        )).scalars().all()
+        spots: dict[int, list[str]] = {}
+        for tid, name in (await session.execute(
+            select(TripSpot.trip_id, TripSpot.name)
+            .where(TripSpot.trip_id.in_([t.id for t in trips]))
+        )).all():
+            spots.setdefault(tid, []).append(name)
+
+    def matches(t: Trip) -> bool:
+        if member and member not in [m.lower() for m in trip_members(t)]:
+            return False
+        return (not keyword
+                or keyword in (t.title or "")
+                or keyword in (t.story_text or "")
+                or any(keyword in s for s in spots.get(t.id, [])))
+
+    found = sorted((t for t in trips if matches(t)),
+                   key=lambda t: t.start_time or t.created_at, reverse=True)
+    playable = [t for t in found if f"T{t.id:04d}" in on_card]
+    if not playable:
+        if found:
+            return {"error": f"找到「{found[0].title or '未命名旅程'}」，但還沒同步到相框"
+                             "（可以問他要不要更新相框）"}
+        return {"error": "相框裡沒有符合的相簿",
+                "albums_on_frame": [t.title or "未命名旅程" for t in trips
+                                    if f"T{t.id:04d}" in on_card]}
+
+    t = playable[0]
+    state["action"] = f"album=T{t.id:04d}"
+    when = (t.start_time or t.created_at).replace(
+        tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
+    return {"ok": True, "album": t.title or "未命名旅程",
+            "date": f"{when.year}-{when.month:02d}-{when.day:02d}",
+            "photos": len(t.photos),
+            "other_matches": [x.title or "未命名旅程" for x in playable[1:4]]}
+
+
+# control_slideshow command -> board token after "photo=" (VoiceChat.h)
+_SLIDESHOW_CMDS = {"next": "next", "previous": "prev",
+                   "pause": "pause", "resume": "resume"}
+_SLIDESHOW_NOTES = {
+    # 小憶 cannot see the photo the board switches to: keep her from
+    # describing it from the old one.
+    "next": "相框換到下一張了；新照片你看不到，不要描述它",
+    "prev": "相框換回上一張了（最多往回 8 張）；那張照片你看不到，不要描述它",
+    "pause": "相框會停在這張，說「繼續播」就會繼續（放著十分鐘也會自己繼續）；"
+             "停著的時候說下一張、上一張可以自己翻",
+    "resume": "相框會繼續自動換照片",
+}
+
+
+async def _voice_tool_read_story(screen: dict, state: dict) -> dict:
+    """Have the board read the album's story out of its phone jack. The audio
+    (STORY.ULW) rides along with the album at sync time, so an album the frame
+    has not synced since this feature landed has no file to play — the board
+    says so on the rail."""
+    trip_id, _ = _like_ids(screen["folder"], screen["photo"])
+    if trip_id is None:
+        return {"error": "相框現在播的不是家人的旅程相簿，沒有遊記可以念"}
+    async with db.SessionLocal() as session:
+        trip = await session.get(Trip, trip_id)
+    if trip is None or not trip.story_text:
+        return {"error": "這本相簿還沒有遊記"}
+    state["action"] = "story=read"
+    return {"ok": True, "album": trip.title or "未命名旅程",
+            "note": "相框馬上念出來；回覆一句就好，不要把遊記唸進回覆裡"}
+
+
+async def _voice_tool_message(frame_id: int, args: dict, screen: dict) -> dict:
+    """Store a message for the family, linked to this recording so the App can
+    play the elder's own voice, and to the photo that was on screen."""
+    text = str(args.get("message") or "").strip()[:300]
+    to = str(args.get("to") or "").strip()[:64] or "家人"
+    if not text:
+        return {"error": "message 不可為空"}
+    trip_id, photo_id = _like_ids(screen["folder"], screen["photo"])
+    async with db.SessionLocal() as session:
+        session.add(FrameMessage(
+            frame_id=frame_id,
+            user_label=screen["user"].strip()[:64],
+            recipient=to,
+            text=text,
+            voice_id=screen["voice_id"],
+            trip_id=trip_id,
+            photo_id=photo_id,
+        ))
+        await session.commit()
+    print(f"[message] frame {frame_id}: '{screen['user'] or '?'}' -> {to}: {text}")
+    return {"ok": True, "note": f"已經把話留給{to}，他們的 App 會收到通知，"
+                                "也聽得到你的聲音"}
+
+
+def _voice_tool_slideshow(args: dict, state: dict) -> dict:
+    cmd = _SLIDESHOW_CMDS.get(str(args.get("command") or "").strip())
+    if cmd is None:
+        return {"error": "command 要是 next / previous / pause / resume"}
+    state["action"] = f"photo={cmd}"
+    return {"ok": True, "note": _SLIDESHOW_NOTES[cmd]}
+
+
+async def _voice_agent(frame_id: int, context: str, image_uri: str | None,
+                       wav: bytes, turns: list[tuple[str, str]],
+                       screen: dict, state: dict) -> tuple[str, str]:
+    """Tool loop: the model hears the question, calls tools as it needs, and
+    ends with respond(transcript, reply). Returns (transcript, reply).
+    screen: what the frame is showing ({"folder", "photo", "user"}).
+    Tools that need the board to do something put it in state["action"]
+    (sent back as X-Frame-Action)."""
+    messages = _voice_messages(VOICE_SYSTEM_TOOLS, context, image_uri, wav, turns)
+
+    for _ in range(VOICE_AGENT_STEPS):
+        m = await asyncio.to_thread(_voice_llm_step, messages)
+        tool_calls = getattr(m, "tool_calls", None)
+
+        if not tool_calls:                  # answered in plain text: take it
+            reply = (m.content or "").strip()
+            if reply:
+                return "", reply
+            raise RuntimeError("empty agent reply")
+
+        # Keep the tool-call ids as they came: through the proxy they carry
+        # Gemini's thought signature, which the next step must send back.
+        messages.append({
+            "role": "assistant", "content": m.content or "",
+            "tool_calls": [{"id": tc.id, "type": "function",
+                            "function": {"name": tc.function.name,
+                                         "arguments": tc.function.arguments}}
+                           for tc in tool_calls],
+        })
+        for tc in tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except ValueError:
+                args = {}
+            if name == "respond":
+                reply = str(args.get("reply") or "").strip()
+                if reply:
+                    return str(args.get("transcript") or "").strip(), reply
+                result: dict = {"error": "reply 不可為空，請重新 respond"}
+            elif name == "query_my_trips":
+                result = await _tool_query_my_trips(args, frame_id=frame_id)
+            elif name == "sync_frame":
+                result = await _voice_tool_sync(frame_id, state)
+            elif name == "like_photo":
+                result = await _voice_tool_like(frame_id, screen)
+            elif name == "show_album":
+                result = await _voice_tool_show_album(frame_id, args, state)
+            elif name == "control_slideshow":
+                result = _voice_tool_slideshow(args, state)
+            elif name == "read_story":
+                result = await _voice_tool_read_story(screen, state)
+            elif name == "leave_message":
+                result = await _voice_tool_message(frame_id, args, screen)
+            else:
+                result = {"error": f"沒有 {name} 這個工具"}
+            print(f"[voice] tool {name}({json.dumps(args, ensure_ascii=False)})")
+            messages.append({"role": "tool", "tool_call_id": tc.id,
+                             "content": json.dumps(result, ensure_ascii=False)})
+
+    raise RuntimeError("voice agent exceeded max steps")
+
+
+def _voice_llm_json(context: str, image_uri: str | None, wav: bytes,
+                    turns: list[tuple[str, str]]) -> tuple[str, str]:
+    """Fallback without tools — one call: hear the question, answer it.
+    Returns (transcript, reply)."""
+    resp = litellm.completion(
+        model=LLM_MODEL,
+        messages=_voice_messages(VOICE_SYSTEM_JSON, context, image_uri, wav, turns),
+        response_format={"type": "json_object"},
+        temperature=0.7,
+        timeout=40,
+        **_voice_llm_extra(),
+    )
+    # With audio in, the model now and then appends text after the JSON object
+    # ("Extra data" from json.loads) - keep the first object, log the rest.
+    text = resp.choices[0].message.content or ""
+    start = text.find("{")
+    if start < 0:
+        raise ValueError(f"no JSON object in reply: {text[:120]!r}")
+    data, end = json.JSONDecoder().raw_decode(text, start)
+    if text[end:].strip():
+        print(f"[voice] ignored text after the JSON: {text[end:].strip()[:120]!r}")
+    return (str(data.get("transcript") or "").strip(),
+            str(data.get("reply") or "").strip())
+
+
+@app.post("/frames/{frame_id}/voice")
+async def frame_voice(frame_id: int, request: Request, rate: int = 8000,
+                      folder: str = "", photo: str = "", user: str = ""):
+    """Body: raw 8-bit mu-law mono (application/octet-stream), sampled at
+    `rate` Hz. folder/photo/user: same meaning as /like. Answers with the
+    reply rendered as a story-rail TIM4 (see textimg.py) — even when the LLM
+    fails, so the rail always shows 小憶 saying something."""
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(status_code=400, detail="empty recording")
+    if len(audio) > VOICE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="recording too long")
+    if not 4000 <= rate <= 48000:
+        raise HTTPException(status_code=400, detail=f"bad rate {rate}")
+
+    async with db.SessionLocal() as session:
+        await get_frame_or_404(session, frame_id)
+        context, image_path = await _voice_context(session, folder, photo, user)
+
+    voice_id = uuid.uuid4().hex[:12]
+    wav = ulaw_to_wav(audio, rate)
+    # Kept so a strange transcript can be listened back to.
+    (AUDIO_DIR / f"voice_{voice_id}.wav").write_bytes(wav)
+    image_uri = (await asyncio.to_thread(photo_data_uri, image_path, 512)
+                 if image_path else None)
+
+    t0 = time.time()
+    turns = _voice_turns(frame_id)
+    state: dict = {}                     # tools -> board: {"action": "..."}
+    if os.environ.get("LLM_MOCK") == "1":
+        question, reply = "（測試模式）", "我是小憶，現在是測試模式，還聽不懂你說的話喔。"
+    else:
+        try:
+            screen = {"folder": folder, "photo": photo, "user": user,
+                      "voice_id": voice_id}
+            question, reply = await _voice_agent(
+                frame_id, context, image_uri, wav, turns, screen, state)
+        except Exception as e:  # noqa: BLE001 — retry without tools
+            print(f"[voice] agent failed ({type(e).__name__}: {str(e)[:200]}); "
+                  f"falling back to a plain answer")
+            state.clear()   # a half-run tool loop must not act on the board
+            try:
+                question, reply = await asyncio.to_thread(
+                    _voice_llm_json, context, image_uri, wav, turns)
+            except Exception as e2:  # noqa: BLE001 — the rail still gets an answer
+                print(f"[voice] LLM failed ({type(e2).__name__}: {str(e2)[:200]})")
+                question, reply = "", "小憶這邊有點忙不過來，等一下再問我好嗎？"
+    llm_ms = int((time.time() - t0) * 1000)
+
+    reply = _NO_GLYPH_RE.sub("", reply).strip() or "我沒有聽清楚，可以再說一次嗎？"
+    if question:
+        _voice_remember(frame_id, question, reply)
+
+    tim4 = render_reply_tim4(question, reply,
+                             preview_png=AUDIO_DIR / f"voice_{voice_id}.png")
+    # Kept so the board can re-fetch the image when the Wi-Fi module drops
+    # bytes mid-download, instead of paying for the answer twice.
+    (AUDIO_DIR / f"voice_{voice_id}.tim").write_bytes(tim4)
+
+    # 小憶 says her answer too: synthesized after this response goes out, and
+    # fetched by the board from .../voice/{id}/audio while it draws the rail.
+    VOICE_REPLY_AUDIO[voice_id] = {"status": "pending", "path": None, "error": ""}
+    asyncio.get_running_loop().create_task(_voice_reply_tts(voice_id, reply))
+    print(f"[voice] frame {frame_id}: {len(audio)} B ({len(audio) * 1000 // rate} ms) "
+          f"at {folder or '-'}/{photo or '-'} user='{user or '?'}' "
+          f"photo={'yes' if image_uri else 'no'} llm={llm_ms}ms id={voice_id}")
+    print(f"[voice] heard: {question or '(nothing)'}")
+    print(f"[voice] reply: {reply}")
+    headers = {"X-Voice-Id": voice_id}
+    if state.get("action"):
+        # ASCII token the board acts on after showing the answer (VoiceChat.c)
+        headers["X-Frame-Action"] = state["action"]
+        print(f"[voice] frame action: {state['action']}")
+    return Response(content=tim4, media_type="application/octet-stream",
+                    headers=headers)
+
+
+# voice_id -> {"status": pending|ready|error, "path": Path, "error": str}
+VOICE_REPLY_AUDIO: dict[str, dict] = {}
+VOICE_AUDIO_WAIT_S = 20          # the board asks right after the answer lands
+
+
+async def _voice_reply_tts(voice_id: str, text: str) -> None:
+    """小憶's answer as 8 kHz mu-law for the frame to play, in her App voice.
+    Runs after the answer has been sent, so it costs the reply no latency."""
+    import edge_tts
+
+    mp3 = AUDIO_DIR / f"reply_{voice_id}.mp3"
+    ulaw = AUDIO_DIR / f"reply_{voice_id}.ulaw"
+    job = VOICE_REPLY_AUDIO[voice_id]
+    try:
+        await edge_tts.Communicate(
+            text, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH).save(str(mp3))
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(mp3),
+            "-ar", "8000", "-ac", "1", "-f", "mulaw", str(ulaw),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(stderr.decode(errors="replace")[-200:])
+        job.update(status="ready", path=ulaw)
+        print(f"[voice] {voice_id} speech ready: {ulaw.stat().st_size} bytes")
+    except Exception as e:  # noqa: BLE001 — the rail still has the text
+        job.update(status="error", error=str(e))
+        print(f"[voice] {voice_id} TTS failed: {e}")
+    finally:
+        mp3.unlink(missing_ok=True)
+
+
+@app.get("/frames/{frame_id}/voice/{voice_id}/audio")
+async def frame_voice_audio(frame_id: int, voice_id: str):
+    """小憶 saying her answer (8 kHz mu-law, as Audio.c plays). Held until the
+    TTS that started with the answer is done."""
+    job = VOICE_REPLY_AUDIO.get(voice_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown voice_id")
+
+    deadline = time.time() + VOICE_AUDIO_WAIT_S
+    while job["status"] == "pending" and time.time() < deadline:
+        await asyncio.sleep(0.1)
+    if job["status"] != "ready":
+        raise HTTPException(status_code=503,
+                            detail=f"speech not ready: {job.get('error', 'timeout')}")
+    return FileResponse(job["path"], media_type="application/octet-stream")
+
+
+@app.get("/frames/{frame_id}/voice/{voice_id}/image")
+def frame_voice_image(frame_id: int, voice_id: str):
+    """The answer as the rail image again — the board re-fetches it when the
+    Wi-Fi module drops bytes, instead of asking the LLM all over again."""
+    if not re.fullmatch(r"[0-9a-f]{12}", voice_id):
+        raise HTTPException(status_code=404, detail="unknown voice_id")
+    tim = AUDIO_DIR / f"voice_{voice_id}.tim"
+    if not tim.exists():
+        raise HTTPException(status_code=404, detail="unknown voice_id")
+    return FileResponse(tim, media_type="application/octet-stream")
+
+
+@app.get("/frames/{frame_id}/voice/{voice_id}/preview")
+def frame_voice_preview(frame_id: int, voice_id: str):
+    """PNG of a reply as the rail shows it (browser check only)."""
+    if not re.fullmatch(r"[0-9a-f]{12}", voice_id):
+        raise HTTPException(status_code=404, detail="unknown voice_id")
+    png = AUDIO_DIR / f"voice_{voice_id}.png"
+    if not png.exists():
+        raise HTTPException(status_code=404, detail="unknown voice_id")
+    return FileResponse(png, media_type="image/png")
 
 
 if __name__ == "__main__":

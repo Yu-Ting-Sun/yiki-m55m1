@@ -120,14 +120,86 @@ def pack_tim4(img: Image.Image) -> bytes:
     return bytes(out)
 
 
+def _save_preview(img: Image.Image, preview_png: Path) -> None:
+    """Browser-checkable preview in the board's actual colors."""
+    bg, fg = (0x18, 0x14, 0x10), (0xF7, 0xF2, 0xE9)
+    rgb = Image.new("RGB", img.size, bg)
+    tint = Image.new("RGB", img.size, fg)
+    rgb.paste(tint, (0, 0), img)
+    rgb.save(preview_png)
+
+
 def render_story_tim4(text: str, header: str = "", subheader: str = "",
                       preview_png: Path | None = None) -> bytes:
     img = render_story_gray(text, header, subheader)
     if preview_png is not None:
-        # Browser-checkable preview in the board's actual colors.
-        bg, fg = (0x18, 0x14, 0x10), (0xF7, 0xF2, 0xE9)
-        rgb = Image.new("RGB", img.size, bg)
-        tint = Image.new("RGB", img.size, fg)
-        rgb.paste(tint, (0, 0), img)
-        rgb.save(preview_png)
+        _save_preview(img, preview_png)
+    return pack_tim4(img)
+
+
+# --- 小憶 voice reply ------------------------------------------------------
+# Same rail, chat layout: "小憶" header, the question as heard (dim, at most
+# Q_MAX_LINES, so the speaker can tell they were understood), a rule, then the
+# answer top-aligned right under it.
+REPLY_HEADER = "小憶"
+Q_SIZE = 15
+Q_LEADING = 21
+Q_MAX_LINES = 3
+
+
+def _ellipsize(lines: list[str], max_lines: int,
+               font: ImageFont.FreeTypeFont, max_w: int) -> list[str]:
+    if len(lines) <= max_lines:
+        return lines
+    kept = lines[:max_lines]
+    last = kept[-1]
+    while last and font.getlength(last + "…") > max_w:
+        last = last[:-1]
+    kept[-1] = last + "…"
+    return kept
+
+
+def render_reply_gray(question: str, reply: str) -> Image.Image:
+    img = Image.new("L", (PANEL_W, PANEL_H), 0)
+    draw = ImageDraw.Draw(img)
+    usable_w = PANEL_W - 2 * PAD_X
+
+    y = PAD_TOP
+    hfont = ImageFont.truetype(FONT_PATH, HEADER_SIZE)
+    draw.text((PAD_X, y), REPLY_HEADER, fill=HEADER_FILL, font=hfont)
+    y += HEADER_SIZE + 10
+
+    if question:
+        qfont = ImageFont.truetype(FONT_PATH, Q_SIZE)
+        qlines = _ellipsize(_wrap(f"「{question}」", qfont, usable_w),
+                            Q_MAX_LINES, qfont, usable_w)
+        for line in qlines:
+            draw.text((PAD_X, y), line, fill=SUB_FILL, font=qfont)
+            y += Q_LEADING
+        y += 4
+
+    draw.line([(PAD_X, y), (PANEL_W - PAD_X, y)], fill=RULE_FILL, width=1)
+    y += HEADER_GAP
+
+    size, leading = STORY_SIZE, STORY_LEADING
+    room = (PANEL_H - PAD_BOTTOM - y) // leading
+    while True:
+        font = ImageFont.truetype(FONT_PATH, size)
+        lines = _wrap(reply, font, usable_w)
+        if len(lines) <= room or size <= STORY_MIN_SIZE:
+            break
+        size -= 1          # long answer: shrink until it fits below the question
+        leading = size + 9
+        room = (PANEL_H - PAD_BOTTOM - y) // leading
+    for line in lines[:max(room, 1)]:
+        draw.text((PAD_X, y), line, fill=255, font=font)
+        y += leading
+    return img
+
+
+def render_reply_tim4(question: str, reply: str,
+                      preview_png: Path | None = None) -> bytes:
+    img = render_reply_gray(question, reply)
+    if preview_png is not None:
+        _save_preview(img, preview_png)
     return pack_tim4(img)

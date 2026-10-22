@@ -58,6 +58,24 @@ int SdSync_Run(bool verbose);
  */
 int SdSync_PostLike(const char *folder, const char *photo, const char *user);
 
+/**
+ * @brief  This board's frame id, for other /frames/<id>/... requests (e.g.
+ *         VoiceChat). Valid once SdSync_Boot has run.
+ * @return frame id, or -1 while offline (no Wi-Fi link to talk over).
+ */
+int SdSync_FrameId(void);
+
+/**
+ * @brief  Download one backend URL straight to a file on the SD card, with
+ *         the same retry as album files. Big payloads stream through the
+ *         HyperRAM buffer, so this costs no SRAM (used for 小憶's spoken
+ *         answer, which is far too big for a RAM buffer).
+ * @param  urlPath  e.g. "/frames/4/voice/ab12cd34/audio"
+ * @param  sdPath   e.g. "0:\\REPLY.ULW" (created/overwritten)
+ * @return 0 saved, <0 HTTP/SD error.
+ */
+int SdSync_DownloadToFile(const char *urlPath, const char *sdPath);
+
 #ifdef __cplusplus
 }
 #endif

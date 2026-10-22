@@ -14,6 +14,7 @@
 #define HTTP_REQ_SZ     1024    /* request line + headers + JSON body */
 #define HTTP_RX_SZ      4096    /* raw response: headers + body */
 #define HTTP_RECV_MS    5000    /* whole-response deadline */
+#define HTTP_SEND_CHUNK 2048    /* AT+CIPSEND hard limit per send */
 
 static char s_req[HTTP_REQ_SZ];
 static char s_rx[HTTP_RX_SZ];
@@ -68,7 +69,7 @@ static int do_request(const char *host, int port, int req_len,
         return rc;
     }
 
-    raw = esp_tcp_recv(s_rx, HTTP_RX_SZ - 1, timeout_ms);
+    raw = esp_tcp_recv_http(s_rx, HTTP_RX_SZ - 1, timeout_ms);
     esp_tcp_close();                       /* no-op if server already closed */
 
     if (raw < 0)
@@ -88,7 +89,7 @@ int http_get(const char *host, int port, const char *path,
     len = snprintf(s_req, sizeof(s_req),
                    "GET %s HTTP/1.1\r\n"
                    "Host: %s:%d\r\n"
-                   "Connection: close\r\n"
+                   "Connection: keep-alive\r\n"
                    "\r\n",
                    path, host, port);
 
@@ -117,7 +118,7 @@ int http_post_json_ex(const char *host, int port, const char *path,
                    "Host: %s:%d\r\n"
                    "Content-Type: application/json\r\n"
                    "Content-Length: %d\r\n"
-                   "Connection: close\r\n"
+                   "Connection: keep-alive\r\n"
                    "\r\n"
                    "%s",
                    path, host, port, (int)strlen(json_body), json_body);
@@ -136,12 +137,12 @@ static const uint8_t *memfind(const uint8_t *hay, int hay_len, const char *needl
     return 0;
 }
 
-/* Value of the Content-Length header inside [hdr, hdr+hdr_len), or -1.
- * Case-insensitive match (uvicorn sends lowercase header names). */
-static int header_content_length(const uint8_t *hdr, int hdr_len)
+/* Where the value of header `key` starts inside [hdr, hdr+hdr_len), or -1.
+ * key is lowercase and includes the colon ("content-length:"); the match is
+ * case-insensitive (uvicorn sends lowercase header names). */
+static int header_find(const uint8_t *hdr, int hdr_len, const char *key)
 {
-    static const char key[] = "content-length:";
-    const int klen = (int)sizeof(key) - 1;
+    const int klen = (int)strlen(key);
 
     for (int i = 0; i + klen <= hdr_len; i++)
     {
@@ -155,49 +156,58 @@ static int header_content_length(const uint8_t *hdr, int hdr_len)
         }
         if (j < klen) continue;
 
-        int v = 0, seen = 0;
-        for (int p = i + klen; p < hdr_len; p++)
-        {
-            char c = (char)hdr[p];
-            if (c == ' ' || c == '\t') { if (seen) break; else continue; }
-            if (c < '0' || c > '9') break;
-            v = v * 10 + (c - '0');
-            seen = 1;
-        }
-        return seen ? v : -1;
+        int p = i + klen;
+        while (p < hdr_len && (hdr[p] == ' ' || hdr[p] == '\t'))
+            p++;
+        return p;
     }
     return -1;
 }
 
-int http_get_binary(const char *host, int port, const char *path,
-                    uint8_t *buf, int buf_cap, int *body_len, int timeout_ms)
+/* Value of the Content-Length header, or -1. */
+static int header_content_length(const uint8_t *hdr, int hdr_len)
 {
-    int len, rc, raw, status;
+    int p = header_find(hdr, hdr_len, "content-length:");
+    int v = 0, seen = 0;
 
-    if (!host || !path || !buf || !body_len || buf_cap < 64)
-        return ESP_ERR_PARAM;
-    *body_len = 0;
-
-    len = snprintf(s_req, sizeof(s_req),
-                   "GET %s HTTP/1.1\r\n"
-                   "Host: %s:%d\r\n"
-                   "Connection: close\r\n"
-                   "\r\n",
-                   path, host, port);
-    if (len <= 0 || len >= (int)sizeof(s_req))
-        return ESP_ERR_PARAM;
-
-    if ((rc = esp_tcp_connect(host, port)) != ESP_OK)
-        return rc;
-
-    if ((rc = esp_tcp_send(s_req, len)) != ESP_OK)
+    if (p < 0)
+        return -1;
+    for (; p < hdr_len && hdr[p] >= '0' && hdr[p] <= '9'; p++)
     {
-        esp_tcp_close();
-        return rc;
+        v = v * 10 + (hdr[p] - '0');
+        seen = 1;
     }
+    return seen ? v : -1;
+}
+
+/* Copy the value of header `key` (up to the line end) into out; "" when the
+ * header is absent. */
+static void header_copy(const uint8_t *hdr, int hdr_len, const char *key,
+                        char *out, int cap)
+{
+    int p = header_find(hdr, hdr_len, key), n = 0;
+
+    if (p >= 0)
+        while (p < hdr_len && hdr[p] != '\r' && hdr[p] != '\n' && n < cap - 1)
+            out[n++] = (char)hdr[p++];
+    out[n] = '\0';
+}
+
+/* Shared tail of the binary requests (request already sent): receive the raw
+ * response into buf, close, check the status line and Content-Length, pull
+ * out header hdr_key if asked (hdr_val may be NULL), and move the body to
+ * the front of buf. */
+static int recv_binary(uint8_t *buf, int buf_cap, int *body_len, int timeout_ms,
+                       http_hdr_out_t *hdrs, int nHdrs)
+{
+    int raw, status;
+
+    for (int i = 0; i < nHdrs; i++)
+        if (hdrs[i].val && hdrs[i].cap > 0)
+            hdrs[i].val[0] = '\0';
 
     /* Headers + body land in the caller's buffer — no intermediate copy. */
-    raw = esp_tcp_recv((char *)buf, buf_cap, timeout_ms);
+    raw = esp_tcp_recv_http((char *)buf, buf_cap, timeout_ms);
     esp_tcp_close();
 
     if (raw < 0)
@@ -217,16 +227,110 @@ int http_get_binary(const char *host, int port, const char *path,
     int blen    = raw - hdr_len;
     if (blen < 0) blen = 0;
 
+    /* Before any verdict: the caller may want the headers of a truncated
+     * response too (e.g. which answer to re-fetch). Parse before the
+     * memmove below destroys the header bytes. */
+    for (int i = 0; i < nHdrs; i++)
+        if (hdrs[i].key && hdrs[i].val && hdrs[i].cap > 0)
+            header_copy(buf, hdr_len, hdrs[i].key, hdrs[i].val, hdrs[i].cap);
+
     /* A dropped +IPD segment must FAIL, not pass as a short HTTP 200 —
-     * a truncated JPEG written to SD looks synced forever. (Parse before
-     * the memmove below destroys the header bytes.) */
+     * a truncated JPEG written to SD looks synced forever. */
     int clen = header_content_length(buf, hdr_len);
     if (clen >= 0 && clen != blen)
+    {
+        /* Seen now and then on 37 KB downloads. The counters (since boot)
+         * tell an MCU-side loss (ring full / UART overrun) from bytes that
+         * never left the ESP. */
+        printf("[HTTP] truncated: %d of %d body bytes (rx ring overflow %u, "
+               "uart overrun %u)\n", blen, clen,
+               (unsigned)esp_ll_rx_overflow(), (unsigned)esp_ll_rx_hw_errors());
         return HTTP_ERR_TRUNC;
+    }
 
     if (blen > 0)
         memmove(buf, buf + hdr_len, (size_t)blen);
     *body_len = blen;
 
     return status;
+}
+
+int http_get_binary(const char *host, int port, const char *path,
+                    uint8_t *buf, int buf_cap, int *body_len, int timeout_ms)
+{
+    int len, rc;
+
+    if (!host || !path || !buf || !body_len || buf_cap < 64)
+        return ESP_ERR_PARAM;
+    *body_len = 0;
+
+    len = snprintf(s_req, sizeof(s_req),
+                   "GET %s HTTP/1.1\r\n"
+                   "Host: %s:%d\r\n"
+                   "Connection: keep-alive\r\n"
+                   "\r\n",
+                   path, host, port);
+    if (len <= 0 || len >= (int)sizeof(s_req))
+        return ESP_ERR_PARAM;
+
+    if ((rc = esp_tcp_connect(host, port)) != ESP_OK)
+        return rc;
+
+    if ((rc = esp_tcp_send(s_req, len)) != ESP_OK)
+    {
+        esp_tcp_close();
+        return rc;
+    }
+
+    return recv_binary(buf, buf_cap, body_len, timeout_ms, NULL, 0);
+}
+
+int http_post_binary(const char *host, int port, const char *path,
+                     const uint8_t *body, int body_len,
+                     uint8_t *buf, int buf_cap, int *resp_len, int timeout_ms,
+                     http_hdr_out_t *hdrs, int nHdrs)
+{
+    int len, rc;
+
+    if (!host || !path || !body || body_len <= 0 ||
+        !buf || !resp_len || buf_cap < 64)
+        return ESP_ERR_PARAM;
+    *resp_len = 0;
+
+    len = snprintf(s_req, sizeof(s_req),
+                   "POST %s HTTP/1.1\r\n"
+                   "Host: %s:%d\r\n"
+                   "Content-Type: application/octet-stream\r\n"
+                   "Content-Length: %d\r\n"
+                   "Connection: keep-alive\r\n"
+                   "\r\n",
+                   path, host, port, body_len);
+    if (len <= 0 || len >= (int)sizeof(s_req))
+        return ESP_ERR_PARAM;
+
+    if ((rc = esp_tcp_connect(host, port)) != ESP_OK)
+        return rc;
+
+    if ((rc = esp_tcp_send(s_req, len)) != ESP_OK)
+    {
+        esp_tcp_close();
+        return rc;
+    }
+
+    /* The server only answers once the whole body is in, so nothing arrives
+     * that esp_tcp_send's RX flush could throw away. */
+    for (int off = 0; off < body_len; off += HTTP_SEND_CHUNK)
+    {
+        int n = body_len - off;
+
+        if (n > HTTP_SEND_CHUNK)
+            n = HTTP_SEND_CHUNK;
+        if ((rc = esp_tcp_send((const char *)body + off, n)) != ESP_OK)
+        {
+            esp_tcp_close();
+            return rc;
+        }
+    }
+
+    return recv_binary(buf, buf_cap, resp_len, timeout_ms, hdrs, nHdrs);
 }
