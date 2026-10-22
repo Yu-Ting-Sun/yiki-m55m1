@@ -44,6 +44,17 @@ int http_post_json_ex(const char *host, int port, const char *path,
 int http_get_binary(const char *host, int port, const char *path,
                     uint8_t *buf, int buf_cap, int *body_len, int timeout_ms);
 
+/* One piece of a large file: GET with "Range: bytes=offset-(offset+count-1)".
+ * Returns 206 with that piece in buf (front) and *total_len = the whole
+ * file's size from Content-Range; or 200 when the server ignored the Range
+ * (then buf holds the WHOLE file and *total_len == *body_len). Each piece is
+ * checked against its own Content-Length like http_get_binary, so a dropped
+ * segment costs one piece's retry instead of the whole file's. */
+int http_get_range(const char *host, int port, const char *path,
+                   int offset, int count,
+                   uint8_t *buf, int buf_cap, int *body_len, int *total_len,
+                   int timeout_ms);
+
 /* Response headers to pull out of a binary request. `key` is lowercase and
  * includes the colon ("x-frame-action:"); `val` gets the value, or "" when
  * the header is absent — including when the body came up short, so a caller

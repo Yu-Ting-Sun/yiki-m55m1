@@ -24,6 +24,10 @@ class RecognitionResult
 public:
     double          m_predict = 0.0;
     std::string     m_label;
+    /* Runner-up PERSON (another label) and its score; -1 when only one
+     * person is enrolled. Recognition needs a clear lead over it. */
+    double          m_second = -1.0;
+    std::string     m_secondLabel;
 	bool			m_recognize;
 
     RecognitionResult() = default;

@@ -285,6 +285,58 @@ int http_get_binary(const char *host, int port, const char *path,
     return recv_binary(buf, buf_cap, body_len, timeout_ms, NULL, 0);
 }
 
+int http_get_range(const char *host, int port, const char *path,
+                   int offset, int count,
+                   uint8_t *buf, int buf_cap, int *body_len, int *total_len,
+                   int timeout_ms)
+{
+    int  len, rc, st;
+    char cr[48];
+    http_hdr_out_t hdr = { "content-range:", cr, (int)sizeof(cr) };
+
+    if (!host || !path || !buf || !body_len || !total_len || buf_cap < 64 ||
+        offset < 0 || count <= 0)
+        return ESP_ERR_PARAM;
+    *body_len  = 0;
+    *total_len = -1;
+
+    len = snprintf(s_req, sizeof(s_req),
+                   "GET %s HTTP/1.1\r\n"
+                   "Host: %s:%d\r\n"
+                   "Range: bytes=%d-%d\r\n"
+                   "Connection: keep-alive\r\n"
+                   "\r\n",
+                   path, host, port, offset, offset + count - 1);
+    if (len <= 0 || len >= (int)sizeof(s_req))
+        return ESP_ERR_PARAM;
+
+    if ((rc = esp_tcp_connect(host, port)) != ESP_OK)
+        return rc;
+
+    if ((rc = esp_tcp_send(s_req, len)) != ESP_OK)
+    {
+        esp_tcp_close();
+        return rc;
+    }
+
+    st = recv_binary(buf, buf_cap, body_len, timeout_ms, &hdr, 1);
+
+    if (st == 206)
+    {
+        /* "bytes 0-65535/269568": the piece must start where we asked, and
+         * the number after '/' is the whole file. */
+        const char *p = strstr(cr, "bytes ");
+        const char *slash = strchr(cr, '/');
+        if (!p || !slash || atoi(p + 6) != offset)
+            return HTTP_ERR_PARSE;
+        *total_len = atoi(slash + 1);
+    }
+    else if (st == 200)
+        *total_len = *body_len;         /* server ignored Range: whole file */
+
+    return st;
+}
+
 int http_post_binary(const char *host, int port, const char *path,
                      const uint8_t *body, int body_len,
                      uint8_t *buf, int buf_cap, int *resp_len, int timeout_ms,

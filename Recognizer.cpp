@@ -124,38 +124,89 @@ bool Recognizer::GetRecognitionResults(
             return false;
     }
 
-    float distance;
-
-    int predictLabelIndex = -1;
-    float closedDisatance = -1;
-
-    for (int i = 0 ; i < labels.size(); i ++)
+    /* Score each PERSON, not each reference: the mean of the label's best
+     * RECOG_TOP_K references. A plain max over all references favoured
+     * whoever had the most of them — with 24 camera shots of one person
+     * against a single selfie each, the selfie owners kept being read as
+     * the 24-shot person. */
+    const int RECOG_TOP_K = 3;
+    struct PersonScore
     {
-        distance = cosine_similarity(embedArray, labels[i].fParam);
+        const std::string *label;
+        float top[RECOG_TOP_K];
+        int   n;
+    };
+    std::vector<PersonScore> people;
 
-        if (distance > closedDisatance)
+    for (size_t i = 0; i < labels.size(); i++)
+    {
+        float d = cosine_similarity(embedArray, labels[i].fParam);
+
+        PersonScore *ps = nullptr;
+        for (auto &p : people)
+            if (*p.label == labels[i].szLable) { ps = &p; break; }
+        if (!ps)
         {
-            predictLabelIndex = i;
-            closedDisatance = distance;
+            people.push_back({ &labels[i].szLable, { -1.0f, -1.0f, -1.0f }, 0 });
+            ps = &people.back();
+        }
+
+        /* keep top[] sorted best-first */
+        if (ps->n < RECOG_TOP_K) ps->n++;
+        for (int k = 0; k < ps->n; k++)
+            if (d > ps->top[k])
+            {
+                for (int m = ps->n - 1; m > k; m--) ps->top[m] = ps->top[m - 1];
+                ps->top[k] = d;
+                break;
+            }
+    }
+
+    int    bestIdx = -1, secondIdx = -1;
+    double best = -1.0, second = -1.0;
+    for (size_t i = 0; i < people.size(); i++)
+    {
+        double s = 0;
+        for (int k = 0; k < people[i].n; k++) s += people[i].top[k];
+        s /= people[i].n;
+
+        if (s > best)
+        {
+            second = best; secondIdx = bestIdx;
+            best = s;      bestIdx = (int)i;
+        }
+        else if (s > second)
+        {
+            second = s; secondIdx = (int)i;
         }
     }
 
-    predResults.m_predict = closedDisatance;
-	predResults.m_recognize = false;
-	
-    if ((predictLabelIndex >= 0) && (closedDisatance > m_threshold))
-    {		
-        predResults.m_label =  labels[predictLabelIndex].szLable;
-		predResults.m_recognize = true;
+    predResults.m_predict = best;
+    predResults.m_second  = second;
+    predResults.m_secondLabel = (secondIdx >= 0) ? *people[secondIdx].label : "";
+    predResults.m_recognize = false;
+
+    if (bestIdx >= 0 && best > m_threshold &&
+        (secondIdx < 0 || best - second >= m_margin))
+    {
+        predResults.m_label = *people[bestIdx].label;
+        predResults.m_recognize = true;
         return true;
     }
 
+    if (bestIdx >= 0)
+        predResults.m_label = *people[bestIdx].label;   /* for the log only */
     return false;
 }
 
 void Recognizer::SetThreshold(double threshold)
 {
     m_threshold = threshold;
+}
+
+void Recognizer::SetMargin(double margin)
+{
+    m_margin = margin;
 }
 
 

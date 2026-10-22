@@ -144,6 +144,8 @@
 #define RUN_GESTURE_LIKE   (1)
 #define LIKE_CONFIRM_HITS  (3)      /* consecutive thumbs-up frames to confirm */
 #define LIKE_COOLDOWN_MS   (10000)  /* one gesture = one like */
+#define LIKE_REARM_MISSES  (4)      /* frames without the gesture before the */
+                                    /* next like: a held thumb is ONE like  */
 
 /* Phase-5: live album filter. Single-frame cosine dips below the threshold
  * (green/red flicker), so the verdict is debounced before it drives the
@@ -613,7 +615,100 @@ static void SlideFilter_Update(const char *label)
                (unsigned)FILTER_CLEAR_MS);
     }
 }
+
+#if RUN_SD_SYNC
+/* Viewing feedback for the App: whenever a recognised viewer's album comes
+ * up (lock, or the next album while the filter is on), tell the backend who
+ * is watching which album. Only changes are sent; the backend also keeps one
+ * record per person and album per 10 minutes. */
+static void View_Report(void)
+{
+    static char lastUser[32] = "", lastFolder[24] = "";
+    char folder[64];
+
+    if (!s_filterUser[0])
+    {
+        lastUser[0] = '\0';             /* next viewer counts as new */
+        return;
+    }
+    Slideshow_GetCurrent(folder, sizeof(folder), NULL, 0);
+    if (folder[0] != 'T')
+        return;                         /* loose photos: not a trip album */
+    if (strcmp(lastUser, s_filterUser) == 0 && strcmp(lastFolder, folder) == 0)
+        return;
+
+    snprintf(lastUser, sizeof(lastUser), "%s", s_filterUser);
+    snprintf(lastFolder, sizeof(lastFolder), "%s", folder);
+    SdSync_PostView(folder, s_filterUser);
+}
+#endif /* RUN_SD_SYNC */
 #endif /* RUN_FACE_RECOG && !RUN_FACE_ENROLL */
+
+#if RUN_SD_SYNC && RUN_CAMERA_PREVIEW && RUN_FACE_DETECT && RUN_FACE_RECOG && \
+    !RUN_FACE_ENROLL
+/*----------------------------------------------------------------------------
+ * 「用相框鏡頭註冊」 (App → backend → doorbell): take CAM_ENROLL_SAMPLES face
+ * shots of whoever stands in front of the frame and add them under `label`.
+ * References from this camera match far better than a phone selfie (live vs
+ * selfie cosine peaks ~0.53, live vs live 0.8+).
+ *--------------------------------------------------------------------------*/
+#define CAM_ENROLL_SAMPLES    (8)
+#define CAM_ENROLL_GAP_MS     (400)     /* spread shots over small head moves */
+#define CAM_ENROLL_TIMEOUT_MS (20000)
+#define CAM_ENROLL_MIN_FACE   (60)      /* px wide in the 240x240 frame       */
+
+static void CameraEnroll_Run(const char *label, bool ready,
+                             uint32_t previewX, uint32_t previewY)
+{
+    char msg[32];
+    int  n = 0;
+
+    (void)previewX;
+    (void)previewY;
+
+    printf("[ENROLL] camera enroll '%s' requested\n", label);
+    if (!ready)
+    {
+        printf("[ENROLL] camera / face models unavailable - not enrolled\n");
+        SdSync_ReportEnroll(label, 0);
+        return;
+    }
+
+    snprintf(msg, sizeof(msg), "%.12s: look here", label);
+    StoryUI_ShowStatus(msg);
+
+    uint32_t t0 = GetSystemTick_ms(), lastShot = 0;
+    while (n < CAM_ENROLL_SAMPLES &&
+           (GetSystemTick_ms() - t0) < CAM_ENROLL_TIMEOUT_MS)
+    {
+        if (Camera_Capture() != 0)
+            break;
+        uint16_t *frame = (uint16_t *)Camera_GetFrame();
+        FaceBox   tb;
+        uint32_t  now = GetSystemTick_ms();
+
+        if ((lastShot == 0 || now - lastShot >= CAM_ENROLL_GAP_MS) &&
+            FaceDetect_Run(frame, CAM_W, CAM_H) > 0 &&
+            FaceDetect_GetTopBox(&tb) && tb.w >= CAM_ENROLL_MIN_FACE &&
+            FaceRecog_Enroll(frame, CAM_W, CAM_H, &tb, label) == 0)
+        {
+            n++;
+            lastShot = now;
+            snprintf(msg, sizeof(msg), "Enroll %d/%d", n, CAM_ENROLL_SAMPLES);
+            StoryUI_ShowStatus(msg);
+        }
+#if SHOW_CAMERA_PREVIEW
+        Camera_Blit(previewX, previewY);
+#endif
+    }
+
+    printf("[ENROLL] '%s': %d camera sample(s)\n", label, n);
+    StoryUI_ShowStatus(n ? "Enrolled" : "No face - try again");
+    SdSync_ReportEnroll(label, n);
+    Display_Delay(1500);
+    Slideshow_RailRefresh();
+}
+#endif
 
 #if RUN_GESTURE_LIKE
 /*----------------------------------------------------------------------------
@@ -626,6 +721,8 @@ static void LikeGesture_Update(int seen)
 {
     static int      hits       = 0;
     static uint32_t lastFireMs = 0;
+    static bool     armed      = true;  /* false after a like until the hand */
+    static int      misses     = 0;     /* has really come down              */
 
     if (seen <= 0)
     {
@@ -636,8 +733,16 @@ static void LikeGesture_Update(int seen)
          * to zero once the gesture actually stops. */
         if (hits > 0)
             hits--;
+        if (!armed && ++misses >= LIKE_REARM_MISSES)
+            armed = true;
         return;
     }
+    misses = 0;
+
+    /* Holding the thumb up used to like again every cooldown, on whatever
+     * photo had come up by then. Now the hand has to come down first. */
+    if (!armed)
+        return;
 
     uint32_t now = GetSystemTick_ms();
     if (lastFireMs != 0 && (now - lastFireMs) < LIKE_COOLDOWN_MS)
@@ -647,6 +752,7 @@ static void LikeGesture_Update(int seen)
 
     hits       = 0;
     lastFireMs = now;
+    armed      = false;
 
     char folder[64], photo[64];
     Slideshow_GetCurrent(folder, sizeof(folder), photo, sizeof(photo));
@@ -1111,6 +1217,10 @@ int main(void)
                 slrc = Slideshow_ShowNext();
                 if (slrc != 0) break;
 
+#if RUN_SD_SYNC && RUN_FACE_RECOG && !RUN_FACE_ENROLL
+                View_Report();          /* who is watching this album */
+#endif
+
 #if RUN_SD_SYNC
                 /* Doorbell between photos: a tiny /pending GET; the actual
                  * download runs only when the App pressed 「立即同步」. On
@@ -1139,6 +1249,23 @@ int main(void)
                             continue;           /* show the new content now */
                         }
                     }
+
+#if RUN_CAMERA_PREVIEW && RUN_FACE_DETECT && RUN_FACE_RECOG && !RUN_FACE_ENROLL
+                    /* 「用相框鏡頭註冊」 rode in on a doorbell answer. */
+                    {
+                        char enrollLbl[24];
+
+                        if (SdSync_TakeEnrollRequest(enrollLbl, sizeof(enrollLbl)))
+                        {
+#if SHOW_CAMERA_PREVIEW
+                            CameraEnroll_Run(enrollLbl, camOk && fdOk && frOk,
+                                             camX, camY);
+#else
+                            CameraEnroll_Run(enrollLbl, camOk && fdOk && frOk, 0, 0);
+#endif
+                        }
+                    }
+#endif
                 }
 #endif
 

@@ -58,7 +58,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 
 import db
-from db import Frame, FrameMessage, GpsPoint, LikeEvent, Photo, Trip, TripSpot
+from db import (Frame, FrameMessage, GpsPoint, LikeEvent, Photo, Trip, TripSpot,
+                ViewEvent)
 from textimg import render_reply_tim4, render_story_tim4
 
 # 從 backend/.env 載入環境變數（若存在）——必須在下面所有 os.environ.get(...)
@@ -552,6 +553,8 @@ async def delete_trip(trip_id: int):
         for media in MEDIA_DIR.glob(f"t{trip_id}_*.*"):
             media.unlink(missing_ok=True)
         await session.execute(delete(TripSpot).where(TripSpot.trip_id == trip_id))
+        # SQLite reuses ids: a new trip must not inherit this one's viewers.
+        await session.execute(delete(ViewEvent).where(ViewEvent.trip_id == trip_id))
         await session.delete(trip)  # ORM cascade removes points + photos rows
         await session.commit()
         # SQLite 會重用 trip_id，殘留的景點快取會張冠李戴
@@ -2097,13 +2100,21 @@ async def _tool_query_my_trips(args: dict, frame_id: int | None = None) -> dict:
         trips = sorted(trips, key=lambda t: t.start_time or t.created_at,
                        reverse=True)
 
-    total_m = sum(t.distance_m for t in trips)
     rows = []
+    matched = 0
+    matched_m = 0.0
     for t in trips:
         members = trip_members(t)
         if member and member not in [m.lower() for m in members]:
             continue
         if keyword and keyword not in (t.title or ""):
+            continue
+        # Count every match, not only the rows returned: "去過台北幾次？" is
+        # answered from this number (the frame-wide total once got read as
+        # the answer — "6 次" for a single Taipei trip).
+        matched += 1
+        matched_m += t.distance_m
+        if len(rows) >= limit:
             continue
         when = t.start_time or t.created_at
         local = when.replace(tzinfo=timezone.utc).astimezone(TAIPEI_TZ)
@@ -2118,11 +2129,14 @@ async def _tool_query_my_trips(args: dict, frame_id: int | None = None) -> dict:
         if frame_id is not None and t.story_text:
             row["story"] = t.story_text[:120]
         rows.append(row)
-        if len(rows) >= limit:
-            break
-    return {"total_trips": len(trips),
-            "total_km": round(total_m / 1000, 1),
-            "trips": rows}
+    out = {"matched_trips": matched,
+           "matched_km": round(matched_m / 1000, 1),
+           "trips": rows}
+    if member or keyword:
+        out["note"] = (f"符合條件（{keyword or member}）的旅程共 {matched} 趟；"
+                       "次數請用 matched_trips，不要用 all_trips")
+    out["all_trips"] = len(trips)
+    return out
 
 
 async def _tool_get_weather(req: GuideRequest, args: dict) -> dict:
@@ -2478,16 +2492,49 @@ async def enroll_face(
     return {"label": label, "files": written}
 
 
-@app.get("/faces")
-async def list_faces():
+def _camera_marker(label: str) -> Path:
+    """Record of a frame-camera enrollment: the references themselves live only
+    on the frame's SD card (embeddings.txt); this file is the backend's note
+    that the label exists there, with how many samples were taken."""
+    return FACE_DIR / f"camera_{label}.json"
+
+
+def _camera_counts() -> dict[str, int]:
+    counts = {}
+    for p in FACE_DIR.glob("camera_*.json"):
+        label = p.stem[len("camera_"):]
+        if not FACE_LABEL_RE.match(label):
+            continue
+        try:
+            counts[label] = int(json.loads(p.read_text("utf-8")).get("count", 0))
+        except (ValueError, OSError):
+            counts[label] = 0
+    return counts
+
+
+def _photo_counts() -> dict[str, int]:
     labels: dict[str, int] = {}
     for p in sorted(FACE_DIR.glob("enroll_*.raw")):
         if not FACE_FILE_RE.match(p.name):
             continue
         base = re.sub(r"-\d+$", "", p.stem[len("enroll_"):])
         labels[base] = labels.get(base, 0) + 1
+    return labels
+
+
+def _all_face_labels() -> list[str]:
+    """Every family member the backend knows (selfie and/or frame camera) —
+    the frame drops reference embeddings of any other label it holds."""
+    return sorted(set(_photo_counts()) | set(_camera_counts()))
+
+
+@app.get("/faces")
+async def list_faces():
+    photos, cams = _photo_counts(), _camera_counts()
     return {"faces": [
-        {"label": k, "photo_count": v} for k, v in sorted(labels.items())
+        {"label": k, "photo_count": photos.get(k, 0),
+         "camera_count": cams.get(k, 0)}
+        for k in sorted(set(photos) | set(cams))
     ]}
 
 
@@ -2496,10 +2543,12 @@ async def delete_face(label: str):
     if not FACE_LABEL_RE.match(label):
         raise HTTPException(status_code=400, detail="invalid label")
     removed = _face_label_files(label)
-    if not removed:
+    marker = _camera_marker(label)
+    if not removed and not marker.exists():
         raise HTTPException(status_code=404, detail=f"未註冊：{label}")
     for p in removed:
         p.unlink(missing_ok=True)
+    marker.unlink(missing_ok=True)
     return {"deleted": label, "files": len(removed)}
 
 
@@ -2607,10 +2656,61 @@ async def request_sync(frame_id: int):
 
 @app.get("/frames/{frame_id}/pending")
 async def sync_pending(frame_id: int):
-    """板子的門鈴輪詢（超小回應）；旗子由 /sync 拉取時清除。"""
+    """板子的門鈴輪詢（超小回應）；旗子由 /sync 拉取時清除。
+    enroll = App 要相框用鏡頭註冊的 label（"" = 沒有）。"""
     async with db.SessionLocal() as session:
         frame = await get_frame_or_404(session, frame_id)
-        return {"pending": bool(frame.sync_requested)}
+        return {"pending": bool(frame.sync_requested),
+                "enroll": frame.enroll_request or ""}
+
+
+class CameraEnrollRequest(BaseModel):
+    label: str
+
+
+@app.post("/frames/{frame_id}/camera-enroll")
+async def request_camera_enroll(frame_id: int, req: CameraEnrollRequest):
+    """App 的「用相框鏡頭註冊」：相框下次輪詢（10 秒內）就請站在前面的人
+    看鏡頭，拍幾張註冊成 label。相框鏡頭拍的參考跟辨識時的畫面同一個來源，
+    比手機自拍準得多（自拍對相框畫面的相似度最高約 0.53）。"""
+    label = req.label.strip()
+    if not FACE_LABEL_RE.match(label):
+        raise HTTPException(status_code=400,
+                            detail="名字只能用英數字、底線、連字號（1-23 字元）")
+    async with db.SessionLocal() as session:
+        frame = await get_frame_or_404(session, frame_id)
+        frame.enroll_request = label
+        await session.commit()
+    print(f"[faces] frame {frame_id}: camera enroll requested for '{label}'")
+    return {"requested": label}
+
+
+class CameraEnrolledIn(BaseModel):
+    label: str
+    count: int = 0
+
+
+@app.post("/frames/{frame_id}/camera-enrolled")
+async def camera_enrolled(frame_id: int, body: CameraEnrolledIn):
+    """相框回報：label 用鏡頭註冊了 count 張（0 = 沒拍到臉）。清旗並記下來，
+    讓 App 的家人臉譜看得到、也讓同步清單把這個 label 列為家人。"""
+    label = body.label.strip()
+    if not FACE_LABEL_RE.match(label):
+        raise HTTPException(status_code=400, detail="invalid label")
+    async with db.SessionLocal() as session:
+        frame = await get_frame_or_404(session, frame_id)
+        if frame.enroll_request == label:
+            frame.enroll_request = ""
+        await session.commit()
+    if body.count > 0:
+        marker = _camera_marker(label)
+        prev = _camera_counts().get(label, 0)
+        marker.write_text(json.dumps({
+            "count": prev + body.count, "frame_id": frame_id,
+            "at": db.iso_z(db.utcnow())}), "utf-8")
+    print(f"[faces] frame {frame_id}: '{label}' camera-enrolled "
+          f"{body.count} sample(s)")
+    return {"ok": True, "label": label, "count": body.count}
 
 
 @app.post("/frames/pair")
@@ -2762,6 +2862,10 @@ async def frame_sync(frame_id: int):
             "faces_root": "faces",
             "trips": items,
             "faces": faces,
+            # Every family member the backend knows. The frame forgets the
+            # reference embeddings of any other label on its card (a face
+            # deleted in the App, or one enrolled straight on the board).
+            "labels": _all_face_labels(),
             "count": len(items),
             "truncated": truncated,
         }
@@ -2844,6 +2948,90 @@ async def frame_likes(frame_id: int, after: int = 0, limit: int = 20):
             })
         return {"likes": likes,
                 "last_id": likes[-1]["id"] if likes else after}
+
+
+# ---------------------------------------------------------------------------
+# 觀看紀錄：相框認出誰站在前面（鎖定），就回報他正在看哪本相簿；鎖定期間
+# 換到別本相簿再報一次。App 的相框頁列出「誰在什麼時候看了哪本」。
+# ---------------------------------------------------------------------------
+
+VIEW_DEDUP_S = 600   # same person, same album within 10 min = one viewing
+
+
+class ViewIn(BaseModel):
+    folder: str = ""     # 相框當下播的相簿，例 "T0016"
+    user: str = ""       # 鎖定認出的人臉 label
+
+
+async def _view_rows(session, rows) -> list[dict]:
+    out = []
+    for ev in rows:
+        title = None
+        if ev.trip_id is not None:
+            trip = await session.get(Trip, ev.trip_id)
+            title = (trip.title or "未命名旅程") if trip else None
+        out.append({
+            "id": ev.id,
+            "trip_id": ev.trip_id,
+            "trip_title": title,
+            "user": ev.user_label,
+            "created_at": db.iso_z(ev.created_at),
+        })
+    return out
+
+
+@app.post("/frames/{frame_id}/view")
+async def frame_view(frame_id: int, body: ViewIn):
+    user = body.user.strip()[:64]
+    trip_id, _ = _like_ids(body.folder, "")
+    if not user or trip_id is None:
+        return {"ok": False, "note": "need a recognised viewer and a trip album"}
+    since = db.utcnow() - timedelta(seconds=VIEW_DEDUP_S)
+    async with db.SessionLocal() as session:
+        await get_frame_or_404(session, frame_id)
+        dup = (await session.execute(
+            select(ViewEvent.id).where(
+                ViewEvent.frame_id == frame_id,
+                ViewEvent.trip_id == trip_id,
+                ViewEvent.user_label == user,
+                ViewEvent.created_at >= since,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if dup is not None:
+            return {"ok": True, "view_id": dup, "duplicate": True}
+        ev = ViewEvent(frame_id=frame_id, trip_id=trip_id, user_label=user)
+        session.add(ev)
+        await session.commit()
+        print(f"[view] frame {frame_id}: '{user}' is watching {body.folder}")
+        return {"ok": True, "view_id": ev.id}
+
+
+@app.get("/frames/{frame_id}/views")
+async def frame_views(frame_id: int, after: int = 0, limit: int = 20,
+                      newest: bool = False):
+    """id > after（舊到新，輪詢用）；newest=true 改回最近 limit 筆（新到舊）。"""
+    limit = max(1, min(limit, 50))
+    async with db.SessionLocal() as session:
+        stmt = select(ViewEvent).where(ViewEvent.frame_id == frame_id)
+        if newest:
+            stmt = stmt.order_by(ViewEvent.id.desc())
+        else:
+            stmt = stmt.where(ViewEvent.id > after).order_by(ViewEvent.id.asc())
+        rows = (await session.execute(stmt.limit(limit))).scalars().all()
+        views = await _view_rows(session, rows)
+        last = max((v["id"] for v in views), default=after)
+        return {"views": views, "last_id": last}
+
+
+@app.get("/trips/{trip_id}/views")
+async def trip_views(trip_id: int, limit: int = 20):
+    """這趟旅程的相簿被誰看過（新到舊）。"""
+    async with db.SessionLocal() as session:
+        rows = (await session.execute(
+            select(ViewEvent).where(ViewEvent.trip_id == trip_id)
+            .order_by(ViewEvent.id.desc()).limit(max(1, min(limit, 50)))
+        )).scalars().all()
+        return {"views": await _view_rows(session, rows)}
 
 
 # ---------------------------------------------------------------------------
@@ -2991,8 +3179,12 @@ VOICE_SYSTEM_TOOLS = (
     "reply 填你的回答。\n"
     "7. 只能說你「真的做了」的事。按讚、換相簿、換照片、留言給家人、念遊記，"
     "都要先呼叫對應的工具才算數；沒呼叫工具，就不要在回覆裡說你做了或會去做。"
-    "長輩說「我喜歡這張」就是要按讚，要按就呼叫 like_photo，"
+    "長輩說「我喜歡這張」「幫我按讚」「讚這張」就是要按讚，要按就呼叫 like_photo，"
     "不按就不要說你會告訴家人。\n"
+    "8. 只是誇照片（拍得很漂亮、天空好藍、風景好美、大家笑得好開心）是在聊照片，"
+    "不是按讚：不要呼叫 like_photo，順著他的話聊就好。\n"
+    "9. like_photo 回傳 already_liked 時，這次沒有再按，要說「剛剛已經按過讚了」，"
+    "不要說又幫他按了一次。\n"
 )
 
 # 相框版小憶的工具（App 版見 GUIDE_TOOLS）。一個一個加：每個工具在
@@ -3017,8 +3209,9 @@ VOICE_TOOLS = [
     {"type": "function", "function": {
         "name": "like_photo",
         "description": "幫長輩對「眼前這張照片」按讚，家人的 App 會收到通知（跟對相框比讚一樣）。"
-                       "他說喜歡這張、要按讚、想讓家人知道他喜歡時用；"
-                       "只是在聊照片內容就不要按。",
+                       "只在他明確說喜歡這張、要按讚、想讓家人知道他喜歡時用"
+                       "（例：我喜歡這張、幫我按讚、讚這張）。"
+                       "只是誇照片拍得好、風景漂亮，或在聊照片內容，都不要按。",
         "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {
         "name": "show_album",
@@ -3250,8 +3443,9 @@ async def _voice_tool_like(frame_id: int, screen: dict) -> dict:
             ).limit(1)
         )).scalar_one_or_none()
         if dup is not None:
-            return {"ok": True, "already_liked": True,
-                    "note": "剛剛已經按過讚了，家人已經收到"}
+            return {"ok": True, "already_liked": True, "liked_now": False,
+                    "note": "這張剛剛已經按過讚了，這次沒有再按；"
+                            "請告訴長輩剛剛已經按過，家人已經收到"}
         await _record_like(session, frame_id, folder, photo, user)
     return {"ok": True, "note": "已按讚，家人的 App 會收到通知"}
 

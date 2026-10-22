@@ -208,7 +208,11 @@ extern "C" int GestureLike_Run(const uint16_t *frameRGB565, int w, int h)
     for (int f = 0; f < 4; f++)
         if (lm[tips[f] * 3 + 1] > thumbTipY + 0.35f * span)
             nBelow++;
-    bool tipsBelow = (nBelow == 4);
+    /* 3 of 4, not all 4: on the board a real, held thumbs-up scored 1-4/4
+     * frame to frame (one finger tip keeps landing near the thumb), so
+     * demanding 4/4 took ~10 s to confirm. An open hand still fails — its
+     * fingertips are ABOVE the thumb, 0/4. */
+    bool tipsBelow = (nBelow >= 3);
 
 #if GESTURE_LIKE_LOG
     printf("[GESTURE] hand p=%.2f span=%.0f thumbUp=%d (rise %.0f/%.0f) "

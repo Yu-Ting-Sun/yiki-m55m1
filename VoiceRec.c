@@ -29,6 +29,12 @@
 #define VR_OUT_RATE     (8000u)
 #define VR_SETTLE_MS    (50u)    /* MEMS wake-up + decimator settling, dropped */
 
+/* Digital gain before mu-law. Speech at arm's length peaked at only
+ * 400-3000 / 32767 on the board (rms 30-50), so mu-law spent most of its
+ * resolution on silence and quiet syllables got lost in transcription.
+ * x8 (+18 dB) puts those peaks at 3200-24000; louder input saturates. */
+#define VR_GAIN         (8)
+
 static uint32_t s_inRate = 0;
 
 int VoiceRec_Init(void)
@@ -105,7 +111,7 @@ const uint8_t *VoiceRec_Capture(uint32_t maxMs, VoiceRec_KeepFn keepGoing,
     uint32_t ms = (maxMs > VOICEREC_MAX_MS) ? VOICEREC_MAX_MS : maxMs;
 
     uint32_t want     = ms * VR_OUT_RATE / 1000u;
-    uint32_t got      = 0, reads = 0;
+    uint32_t got      = 0, reads = 0, clipped = 0;
     int32_t  half     = 0, peak = 0;
     int      haveHalf = 0;
     uint64_t sumSq    = 0;
@@ -147,7 +153,10 @@ const uint8_t *VoiceRec_Capture(uint32_t maxMs, VoiceRec_KeepFn keepGoing,
             peak = a;
         sumSq += (uint64_t)((int64_t)s * s);
 
-        s_ulaw[got++] = mulaw_encode(s);
+        int32_t g = s * VR_GAIN;
+        if (g > 32767)       { g = 32767;  clipped++; }
+        else if (g < -32768) { g = -32768; clipped++; }
+        s_ulaw[got++] = mulaw_encode(g);
 
         /* Every 10 ms of audio: still talking? (a GPIO read - quick
          * enough that the 16 kHz FIFO never backs up meanwhile) */
@@ -161,10 +170,12 @@ const uint8_t *VoiceRec_Capture(uint32_t maxMs, VoiceRec_KeepFn keepGoing,
     /* reads over elapsed time checks that one FIFO read really is one 16 kHz
      * sample; peak/rms tell how much gain headroom real speech leaves. */
     uint32_t dt = GetSystemTick_ms() - t1;
-    printf("[VREC] captured %u B (%u ms audio) in %u ms, %u reads, peak %d, rms %u\n",
+    printf("[VREC] captured %u B (%u ms audio) in %u ms, %u reads, peak %d, rms %u "
+           "(gain x%d, %u clipped)\n",
            (unsigned)got, (unsigned)(got * 1000u / VR_OUT_RATE), (unsigned)dt,
            (unsigned)reads, (int)peak,
-           got ? (unsigned)sqrtf((float)sumSq / (float)got) : 0u);
+           got ? (unsigned)sqrtf((float)sumSq / (float)got) : 0u,
+           VR_GAIN, (unsigned)clipped);
 
     if (nBytes)
         *nBytes = got;

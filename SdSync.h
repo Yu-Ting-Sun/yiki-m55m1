@@ -59,6 +59,29 @@ int SdSync_Run(bool verbose);
 int SdSync_PostLike(const char *folder, const char *photo, const char *user);
 
 /**
+ * @brief  Report who is watching which album (viewing feedback for the App):
+ *         POST /frames/<id>/view {"folder","user"}. The backend keeps one
+ *         record per person and album per 10 minutes.
+ * @return 0 delivered, <0 offline / HTTP error / nothing to report.
+ */
+int SdSync_PostView(const char *folder, const char *user);
+
+/**
+ * @brief  The App asked (「用相框鏡頭註冊」) to enroll a family member with the
+ *         frame camera; the request rides on the doorbell answer. Returns it
+ *         once — the caller runs the enrollment and reports back.
+ * @return true and the label in `label` when a request is waiting.
+ */
+bool SdSync_TakeEnrollRequest(char *label, int cap);
+
+/**
+ * @brief  Tell the backend a camera enrollment finished:
+ *         POST /frames/<id>/camera-enrolled {"label","count"}. count 0 =
+ *         nobody was seen (the App shows it was not enrolled).
+ */
+int SdSync_ReportEnroll(const char *label, int count);
+
+/**
  * @brief  This board's frame id, for other /frames/<id>/... requests (e.g.
  *         VoiceChat). Valid once SdSync_Boot has run.
  * @return frame id, or -1 while offline (no Wi-Fi link to talk over).

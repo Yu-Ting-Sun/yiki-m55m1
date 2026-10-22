@@ -54,8 +54,15 @@ public:
 
     void SetThreshold(double threshold);
 
+    /**
+    * @brief       Minimum lead of the best person over the runner-up person;
+    *              closer than this is "unknown" rather than a coin toss.
+    **/
+    void SetMargin(double margin);
+
 private:
     double m_threshold;
+    double m_margin = 0.0;
 };
 
 } /* namespace app */

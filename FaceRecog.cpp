@@ -39,6 +39,10 @@
 /* 0.6 rejects photo-enrolled references: live-vs-photo cosine peaks at ~0.53
  * (live-vs-live is 0.8+), so the App/selfie registration path needs 0.50. */
 #define RECOG_THRESHOLD    (0.50)
+/* The best person must beat the runner-up person by this much; closer is a
+ * coin toss and is reported as unknown (the filter debounce then just waits
+ * for a clearer frame instead of locking onto the wrong family member). */
+#define RECOG_MARGIN       (0.05)
 #define RECOG_BOX_COLOR    (0x07E0)   /* green in RGB565 */
 #define RECOG_BOX_THICK    (2)
 
@@ -99,6 +103,7 @@ extern "C" int FaceRecog_Init(void)
     }
 
     s_recognizer.SetThreshold(RECOG_THRESHOLD);
+    s_recognizer.SetMargin(RECOG_MARGIN);
 
     /* Reference embeddings are optional at enroll time. */
     size_t n = 0;
@@ -201,7 +206,13 @@ extern "C" int FaceRecog_Run(uint16_t *frame, int fw, int fh, const FaceBox *box
 
     if (ok && result.m_recognize)
     {
-        printf("[FACEREC] recognized: %s (%.3f)\n", result.m_label.c_str(), result.m_predict);
+        if (result.m_second >= 0)
+            printf("[FACEREC] recognized: %s (%.3f; next %s %.3f)\n",
+                   result.m_label.c_str(), result.m_predict,
+                   result.m_secondLabel.c_str(), result.m_second);
+        else
+            printf("[FACEREC] recognized: %s (%.3f)\n",
+                   result.m_label.c_str(), result.m_predict);
         strncpy(s_lastLabel, result.m_label.c_str(), sizeof(s_lastLabel) - 1);
         s_lastLabel[sizeof(s_lastLabel) - 1] = '\0';
         draw_rect(frame, fw, fh, box->x, box->y, box->w, box->h,
@@ -209,7 +220,12 @@ extern "C" int FaceRecog_Run(uint16_t *frame, int fw, int fh, const FaceBox *box
         return 1;
     }
 
-    printf("[FACEREC] unknown (best %.3f)\n", result.m_predict);
+    if (result.m_predict > RECOG_THRESHOLD && result.m_second >= 0)
+        printf("[FACEREC] unknown (%s %.3f vs %s %.3f - too close)\n",
+               result.m_label.c_str(), result.m_predict,
+               result.m_secondLabel.c_str(), result.m_second);
+    else
+        printf("[FACEREC] unknown (best %.3f)\n", result.m_predict);
     return 0;
 }
 
@@ -263,6 +279,56 @@ extern "C" int FaceRecog_Enroll(uint16_t *frame, int fw, int fh,
     printf("[FACEREC] enrolled '%s' (%u-dim) -> %s\n",
            label, (unsigned)emb.size(), EMBED_REF_FILE);
     return 0;
+}
+
+extern "C" int FaceRecog_ListLabels(char out[][24], int max)
+{
+    /* Straight from the file (each line starts "label:"), so it works at
+     * boot sync time, before FaceRecog_Init has loaded anything. */
+    FIL  f;
+    char rbuf[512], lbl[24];
+    UINT br = 0;
+    int  n = 0, li = 0;
+    bool atStart = true, inLabel = true;
+
+    if (f_open(&f, EMBED_REF_FILE, FA_READ) != FR_OK)
+        return 0;
+
+    while (f_read(&f, rbuf, sizeof(rbuf), &br) == FR_OK && br > 0)
+    {
+        for (UINT i = 0; i < br; i++)
+        {
+            char c = rbuf[i];
+
+            if (c == '\n')
+            {
+                atStart = inLabel = true;
+                li = 0;
+                continue;
+            }
+            if (!inLabel)
+                continue;
+            if (c == ':')
+            {
+                lbl[li] = '\0';
+                inLabel = false;
+                if (li == 0 || !atStart)
+                    continue;
+                bool dup = false;
+                for (int k = 0; k < n; k++)
+                    if (strcmp(out[k], lbl) == 0) { dup = true; break; }
+                if (!dup && n < max)
+                    strcpy(out[n++], lbl);
+                continue;
+            }
+            if (li < (int)sizeof(lbl) - 1)
+                lbl[li++] = c;
+            else
+                inLabel = false;        /* not a label: overlong token */
+        }
+    }
+    f_close(&f);
+    return n;
 }
 
 extern "C" int FaceRecog_ForgetLabel(const char *label)

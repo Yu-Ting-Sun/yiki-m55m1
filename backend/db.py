@@ -105,6 +105,9 @@ class Frame(Base):
     sync_requested: Mapped[int] = mapped_column(Integer, default=0)
     # 上次拉 /sync 時發給板子的 {folder: version} 快照——「待同步」計數用。
     synced_versions: Mapped[str] = mapped_column(Text, default="{}")
+    # App 按「用相框鏡頭註冊」立的旗：要註冊的 label（"" = 沒有）。板子輪詢
+    # /pending 看到就用相框鏡頭拍幾張註冊，回報 /faces/camera-enrolled 後清除。
+    enroll_request: Mapped[str] = mapped_column(String(32), default="")
 
 
 class LikeEvent(Base):
@@ -141,6 +144,19 @@ class FrameMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
 
 
+class ViewEvent(Base):
+    """誰在相框前看了哪本相簿：板子鎖定認出的人、或鎖定期間換到另一本相簿
+    時 POST /frames/{id}/view。同一人同一本相簿短時間內只記一筆。"""
+
+    __tablename__ = "view_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    frame_id: Mapped[int] = mapped_column(Integer, index=True)
+    trip_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    user_label: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -161,6 +177,8 @@ async def init_db() -> None:
                           "sync_requested INTEGER NOT NULL DEFAULT 0")
         await add_missing("frames", "synced_versions",
                           "synced_versions TEXT NOT NULL DEFAULT '{}'")
+        await add_missing("frames", "enroll_request",
+                          "enroll_request VARCHAR(32) NOT NULL DEFAULT ''")
 
 
 def utcnow() -> datetime:

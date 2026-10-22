@@ -67,6 +67,14 @@ int FaceRecog_Enroll(uint16_t *frame, int fw, int fh, const FaceBox *box,
  */
 int FaceRecog_ForgetLabel(const char *label);
 
+/**
+ * @brief  The distinct labels in 0:\faces\embeddings.txt (read from the file,
+ *         so it also works before FaceRecog_Init). Used by the sync to drop
+ *         people the App no longer lists.
+ * @return number of labels written to out (at most max).
+ */
+int FaceRecog_ListLabels(char out[][24], int max);
+
 #ifdef __cplusplus
 }
 #endif

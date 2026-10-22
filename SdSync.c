@@ -48,8 +48,20 @@
 #endif
 
 #define SYNC_MANIFEST_TMO   (15000)
-#define SYNC_FILE_TMO       (30000)     /* enroll raw 115 KB @ ~11.5 KB/s   */
+#define SYNC_FILE_TMO       (30000)     /* one DL_CHUNK piece, generous       */
 #define PAIR_CODE_SHOW_MS   (5000)      /* pair code on the rail at boot    */
+
+/* Files come down in pieces of this size (HTTP Range). On a long transfer
+ * the Wi-Fi module now and then drops a few hundred bytes (270-305 KB story
+ * audio: 2 of 8 short); a piece is checked against its own Content-Length,
+ * so a loss costs one 64 KB retry instead of the whole file. */
+#define DL_CHUNK            (64 * 1024)
+#define DL_TRIES            (3)         /* per piece                        */
+
+/* Last frame id the backend gave us. Booting while the backend is down used
+ * to fall back to id 1 (the demo frame), so likes, messages and the sync
+ * doorbell all went to the wrong frame until the next good boot. */
+#define FRAME_ID_FILE       "0:\\FRAME.TXT"
 
 /* Slideshow frame buffer, borrowed while the slideshow is between photos:
  * first 768 KB = file downloads, last 256 KB = manifest text. */
@@ -59,8 +71,9 @@
 #define MAN_CAP     ((int)SLIDESHOW_FB_SIZE - DL_CAP)
 
 static bool s_wifiUp  = false;
-static int  s_frameId = 1;              /* until /frames/register answers   */
+static int  s_frameId = 1;              /* until FRAME.TXT / register       */
 static FIL  s_file;                     /* FIL is large; keep off the stack */
+static char s_enrollReq[24] = "";       /* App: enroll this label by camera */
 
 /*----------------------------------------------------------------------------
  * Tiny fixed-structure JSON scanning (byte-based, escape-aware)
@@ -253,43 +266,86 @@ static void file_ver_write(const char *path, const char *ver)
     }
 }
 
-/* GET urlPath -> SD sdPath (whole file through DL_BUF). 0 on success. */
+/* GET urlPath -> SD sdPath, DL_CHUNK bytes per request (HTTP Range), each
+ * piece retried on its own. A server that ignores Range answers 200 with the
+ * whole file in the first piece, which is written as is. A failed file is
+ * deleted, never left half-written. 0 on success. */
 static int dl_to_file(const char *urlPath, const char *sdPath)
 {
-    int blen = 0, st = 0;
+    int  off = 0, total = -1, pieces = 0, retries = 0;
+    bool open = false;
 
-    /* One in-place retry: dropped +IPD data now comes back as
-     * HTTP_ERR_TRUNC instead of a silently short 200. */
-    for (int attempt = 0; attempt < 2; attempt++)
+    for (;;)
     {
-        blen = 0;
-        st = http_get_binary(BACKEND_HOST, BACKEND_PORT, urlPath,
-                             DL_BUF, DL_CAP, &blen, SYNC_FILE_TMO);
-        if (st == 200)
+        int blen = 0, tot = -1, st = 0;
+
+        /* Dropped +IPD data comes back as HTTP_ERR_TRUNC, never as a
+         * silently short piece. */
+        for (int attempt = 0; attempt < DL_TRIES; attempt++)
+        {
+            st = http_get_range(BACKEND_HOST, BACKEND_PORT, urlPath,
+                                off, DL_CHUNK, DL_BUF, DL_CAP,
+                                &blen, &tot, SYNC_FILE_TMO);
+            if (st == 206 || st == 200)
+                break;
+            retries++;
+            printf("[SYNC] GET %s @%d -> %d%s\n", urlPath, off, st,
+                   attempt + 1 < DL_TRIES ? " (retrying)" : "");
+        }
+
+        if (st != 206 && st != 200)
+        {
+            if (open)
+            {
+                f_close(&s_file);
+                f_unlink(sdPath);
+            }
+            return (st < 0) ? st : -st;
+        }
+
+        if (!open)
+        {
+            if (f_open(&s_file, sdPath, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK)
+            {
+                printf("[SYNC] cannot create %s\n", sdPath);
+                return -200;
+            }
+            open = true;
+        }
+
+        if (st == 200 && off != 0)
+        {
+            /* Range dropped mid-file: this answer is the whole file. */
+            f_lseek(&s_file, 0);
+            f_truncate(&s_file);
+            off = 0;
+        }
+
+        UINT    bw = 0;
+        FRESULT fr = f_write(&s_file, DL_BUF, (UINT)blen, &bw);
+        if (fr != FR_OK || (int)bw != blen)
+        {
+            printf("[SYNC] short write %s (%u/%d)\n", sdPath, (unsigned)bw, blen);
+            f_close(&s_file);
+            f_unlink(sdPath);
+            return -201;
+        }
+
+        off   += blen;
+        total  = tot;
+        pieces++;
+
+        if (st == 200 || blen == 0 || total < 0 || off >= total)
             break;
-        printf("[SYNC] GET %s -> %d%s\n", urlPath, st,
-               attempt == 0 ? " (retrying)" : "");
-    }
-    if (st != 200)
-        return (st < 0) ? st : -st;
-
-    if (f_open(&s_file, sdPath, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK)
-    {
-        printf("[SYNC] cannot create %s\n", sdPath);
-        return -200;
     }
 
-    UINT    bw = 0;
-    FRESULT fr = f_write(&s_file, DL_BUF, (UINT)blen, &bw);
     f_close(&s_file);
 
-    if (fr != FR_OK || (int)bw != blen)
-    {
-        printf("[SYNC] short write %s (%u/%d)\n", sdPath, (unsigned)bw, blen);
-        return -201;
-    }
-
-    printf("[SYNC] %s (%d B)\n", sdPath, blen);
+    if (pieces > 1 || retries)
+        printf("[SYNC] %s (%d B, %d piece(s), %d retr%s)\n", sdPath, off,
+               pieces, retries, retries == 1 ? "y" : "ies");
+    else
+        printf("[SYNC] %s (%d B)\n", sdPath, off);
     return 0;
 }
 
@@ -337,9 +393,44 @@ static int get_int(const char *obj, const char *end, const char *key, int fallba
 }
 
 
+/* Adopt the frame id the backend gave us at an earlier boot (FRAME.TXT).
+ * Returns true when one was found. */
+static bool frame_id_load(void)
+{
+    char buf[12] = { 0 };
+    UINT br = 0;
+    int  id = 0;
+
+    if (f_open(&s_file, FRAME_ID_FILE, FA_OPEN_EXISTING | FA_READ) != FR_OK)
+        return false;
+    f_read(&s_file, buf, sizeof(buf) - 1, &br);
+    f_close(&s_file);
+
+    for (UINT i = 0; i < br && buf[i] >= '0' && buf[i] <= '9'; i++)
+        id = id * 10 + (buf[i] - '0');
+    if (id <= 0)
+        return false;
+    s_frameId = id;
+    return true;
+}
+
+static void frame_id_save(int id)
+{
+    char buf[12];
+    UINT bw = 0;
+    int  n  = snprintf(buf, sizeof(buf), "%d", id);
+
+    if (f_open(&s_file, FRAME_ID_FILE, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
+    {
+        f_write(&s_file, buf, (UINT)n, &bw);
+        f_close(&s_file);
+    }
+}
+
 /* POST /frames/register with the ESP MAC; adopt the returned frame_id and
  * show the pair code on the story rail so the App can pair. Best-effort:
- * on failure the board keeps the default frame id. */
+ * on failure the board keeps the id from FRAME.TXT (or the default 1 on a
+ * card that never registered). */
 static void register_frame(void)
 {
     char mac[20], body[64], resp[192], code[16], msg[24];
@@ -361,7 +452,10 @@ static void register_frame(void)
     }
 
     const char *end = resp + strlen(resp);
+    int stored = s_frameId;
     s_frameId = get_int(resp, end, "frame_id", s_frameId);
+    if (s_frameId != stored || !sd_exists(FRAME_ID_FILE))
+        frame_id_save(s_frameId);
 
     if (get_str(resp, end, "pair_code", code, sizeof(code)) == 0)
     {
@@ -398,15 +492,22 @@ static bool albums_present(const char *sdRoot)
 }
 
 
-/* Tiny doorbell request: has the App pressed 「立即同步」? */
+/* Tiny doorbell request: has the App pressed 「立即同步」? The same answer
+ * carries a pending 「用相框鏡頭註冊」 request: {"pending":false,"enroll":"mom"}
+ * (picked up with SdSync_TakeEnrollRequest). */
 static bool check_pending(void)
 {
-    char path[40], resp[64];
+    char path[40], resp[128];
 
     snprintf(path, sizeof(path), "/frames/%d/pending", s_frameId);
     if (http_get(BACKEND_HOST, BACKEND_PORT, path, resp, sizeof(resp)) != 200)
         return false;
-    return strstr(resp, "true") != NULL;
+
+    const char *end = resp + strlen(resp);
+    char enroll[sizeof(s_enrollReq)];
+    if (get_str(resp, end, "enroll", enroll, sizeof(enroll)) == 0 && enroll[0])
+        strcpy(s_enrollReq, enroll);
+    return get_bool(resp, end, "pending");
 }
 
 /*----------------------------------------------------------------------------
@@ -753,6 +854,56 @@ static int sync_faces(const char *man, const char *end, const char *facesRoot)
     return added;
 }
 
+/* Forget the reference embeddings of every label on the card the backend no
+ * longer lists (manifest "labels"): a face deleted in the App, or one that
+ * was enrolled straight on the board (camera enroll firmware) and never
+ * registered in the App — which then outnumbered and out-matched the family.
+ * A backend without the list (older) leaves the card alone. */
+static int prune_labels(const char *man, const char *end)
+{
+    static char known[24][24], have[24][24];
+    int nKnown = 0, removed = 0;
+    const char *aEnd;
+    const char *a = find_array(man, end, "labels", &aEnd);
+
+    if (!a)
+        return 0;
+
+    for (const char *p = a; p < aEnd && nKnown < 24; )
+    {
+        if (*p != '"')
+        {
+            p++;
+            continue;
+        }
+        const char *e = str_skip(p, aEnd);
+        if (!e)
+            break;
+        int n = (int)(e - 1 - (p + 1));
+        if (n > 0 && n < (int)sizeof(known[0]))
+        {
+            memcpy(known[nKnown], p + 1, (size_t)n);
+            known[nKnown++][n] = '\0';
+        }
+        p = e;
+    }
+
+    int nHave = FaceRecog_ListLabels(have, 24);
+    for (int i = 0; i < nHave; i++)
+    {
+        bool listed = false;
+        for (int k = 0; k < nKnown; k++)
+            if (strcmp(have[i], known[k]) == 0) { listed = true; break; }
+        if (!listed && FaceRecog_ForgetLabel(have[i]) > 0)
+        {
+            printf("[SYNC] face '%s' is not registered in the app - forgotten\n",
+                   have[i]);
+            removed++;
+        }
+    }
+    return removed;
+}
+
 int SdSync_Run(bool verbose)
 {
     char path[40];
@@ -814,6 +965,7 @@ int SdSync_Run(bool verbose)
     if (newFaces > 0)
         printf("[SYNC] %d new face file(s) downloaded - reboot to enroll\n",
                newFaces);
+    prune_labels(man, end);
 
     if (verbose)
         StoryUI_ShowStatus(changed ? "Sync done" : "Up to date");
@@ -824,6 +976,9 @@ int SdSync_Run(bool verbose)
 
 int SdSync_Boot(void)
 {
+    if (frame_id_load())
+        printf("[SYNC] frame id %d from card (last registration)\n", s_frameId);
+
     StoryUI_ShowStatus("WiFi connecting");
     if (wifi_up() != 0)
     {
@@ -869,6 +1024,48 @@ int SdSync_PostLike(const char *folder, const char *photo, const char *user)
     int st = http_post_json(BACKEND_HOST, BACKEND_PORT, path,
                             body, resp, sizeof(resp));
     printf("[LIKE] POST %s %s -> %d\n", path, body, st);
+    return (st == 200) ? 0 : -2;
+}
+
+int SdSync_PostView(const char *folder, const char *user)
+{
+    char path[48], body[128], resp[96];
+
+    if (!s_wifiUp || !folder || !folder[0] || !user || !user[0])
+        return -1;
+
+    snprintf(path, sizeof(path), "/frames/%d/view", s_frameId);
+    snprintf(body, sizeof(body), "{\"folder\":\"%s\",\"user\":\"%s\"}",
+             folder, user);
+
+    int st = http_post_json(BACKEND_HOST, BACKEND_PORT, path,
+                            body, resp, sizeof(resp));
+    printf("[VIEW] '%s' is watching %s -> %d\n", user, folder, st);
+    return (st == 200) ? 0 : -2;
+}
+
+bool SdSync_TakeEnrollRequest(char *label, int cap)
+{
+    if (!s_enrollReq[0] || !label || cap <= 0)
+        return false;
+    snprintf(label, (size_t)cap, "%s", s_enrollReq);
+    s_enrollReq[0] = '\0';
+    return true;
+}
+
+int SdSync_ReportEnroll(const char *label, int count)
+{
+    char path[48], body[80], resp[96];
+
+    if (!s_wifiUp || !label || !label[0])
+        return -1;
+
+    snprintf(path, sizeof(path), "/frames/%d/camera-enrolled", s_frameId);
+    snprintf(body, sizeof(body), "{\"label\":\"%s\",\"count\":%d}", label, count);
+
+    int st = http_post_json(BACKEND_HOST, BACKEND_PORT, path,
+                            body, resp, sizeof(resp));
+    printf("[ENROLL] reported '%s' x%d -> %d\n", label, count, st);
     return (st == 200) ? 0 : -2;
 }
 
