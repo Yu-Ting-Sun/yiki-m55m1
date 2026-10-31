@@ -345,7 +345,7 @@ static int show_bmp(const char *path, uint32_t panelW, uint32_t panelH)
  * Photo library — albums are the subfolders of the root, each optionally
  * carrying a label.json ({"users": ["user1", ...]}, hand-written or later
  * emitted by the backend). Loose files in the root form an unlabeled
- * pseudo-album (index 0) that only plays when no filter is active, so a flat
+ * pseudo-album (index 0) that plays only on a card with no albums, so a flat
  * pictures/ SD card from the pre-album era keeps working unchanged.
  *--------------------------------------------------------------------------*/
 #define LIB_MAX_ALBUMS      (16)
@@ -455,9 +455,13 @@ static void lib_read_label(const char *dirPath, Album *al)
 /* Rebuild s_matched from s_filter and flag the iterator for a restart. */
 static void lib_apply_filter(void)
 {
+    /* Loose root files belong to no trip: once the card has albums they would
+     * only show beside an empty story rail, so they stay out of every set. */
+    uint8_t first = (s_nAlbums > 1) ? 1 : 0;
+
     s_nMatched = 0;
 
-    for (uint8_t i = 0; i < s_nAlbums; i++)
+    for (uint8_t i = first; i < s_nAlbums; i++)
     {
         if (s_filter[0] == 0)
         {
@@ -479,7 +483,7 @@ static void lib_apply_filter(void)
         /* Unknown user: degrade to playing everything (same philosophy as
          * the Wi-Fi fallback — never a black screen). */
         printf("[SLIDESHOW] filter '%s' matches no album -> playing all\n", s_filter);
-        for (uint8_t i = 0; i < s_nAlbums; i++)
+        for (uint8_t i = first; i < s_nAlbums; i++)
             s_matched[s_nMatched++] = i;
     }
 

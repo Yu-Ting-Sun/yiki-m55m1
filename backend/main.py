@@ -542,16 +542,28 @@ async def trip_detail(trip_id: int):
         return detail
 
 
+async def unlink_when_free(path: Path) -> None:
+    """刪檔。Windows 上正在傳給 App 的檔案（例如旅程列表正在載的封面）
+    刪不掉，等傳完再刪；等了 5 秒還在用就留在磁碟上，不讓整個刪除失敗。"""
+    for _ in range(20):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            await asyncio.sleep(0.25)
+    print(f"[files] {path.name} still in use; left on disk")
+
+
 @app.delete("/trips/{trip_id}")
 async def delete_trip(trip_id: int):
     async with db.SessionLocal() as session:
         trip = await get_trip_or_404(session, trip_id, with_children=True)
         for ph in trip.photos:
-            (PHOTO_DIR / ph.filename).unlink(missing_ok=True)
+            await unlink_when_free(PHOTO_DIR / ph.filename)
             for board in PHOTO_DIR.glob(f"board_{ph.id}_*.jpg"):
-                board.unlink(missing_ok=True)
+                await unlink_when_free(board)
         for media in MEDIA_DIR.glob(f"t{trip_id}_*.*"):
-            media.unlink(missing_ok=True)
+            await unlink_when_free(media)
         await session.execute(delete(TripSpot).where(TripSpot.trip_id == trip_id))
         # SQLite reuses ids: a new trip must not inherit this one's viewers.
         await session.execute(delete(ViewEvent).where(ViewEvent.trip_id == trip_id))
@@ -621,9 +633,9 @@ async def delete_photo(photo_id: int):
         fname = photo.filename
         await session.delete(photo)
         await session.commit()
-    (PHOTO_DIR / fname).unlink(missing_ok=True)
+    await unlink_when_free(PHOTO_DIR / fname)
     for cache in PHOTO_DIR.glob(f"board_{photo_id}_*.jpg"):
-        cache.unlink(missing_ok=True)
+        await unlink_when_free(cache)
     print(f"[photos] deleted photo {photo_id} ({fname})")
     return {"deleted": True}
 

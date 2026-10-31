@@ -12,6 +12,8 @@
  *
  * Per album: skip whole album when SD VERSION.TXT == manifest version, else
  * download every file and write VERSION.TXT last (torn sync self-heals).
+ * Either way, files the manifest no longer lists are deleted from the album
+ * folder (photos removed in the App, a cleared story).
  * STORY.TXT is not fetched (the rail renders the pre-drawn STORY.TIM), nor
  * is the 16-bit STORY.WAV — 小憶 reads the story from STORY.ULW instead,
  * the same audio as 8 kHz mu-law at a quarter of the bytes (Audio.c).
@@ -514,7 +516,96 @@ static bool check_pending(void)
  * Album / faces sync
  *--------------------------------------------------------------------------*/
 
-/* Returns 1 if the album was (re)downloaded, 0 if up to date / unusable. */
+/* ASCII case-insensitive equality (FAT names are case-insensitive). */
+static bool name_ieq(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++)
+    {
+        char ca = (*a >= 'a' && *a <= 'z') ? (char)(*a - 32) : *a;
+        char cb = (*b >= 'a' && *b <= 'z') ? (char)(*b - 32) : *b;
+        if (ca != cb)
+            return false;
+    }
+    return *a == *b;
+}
+
+/* Does the trip's manifest entry still want this album file? */
+static bool album_file_wanted(const char *fname, const char *photos,
+                              const char *photosEnd, bool hasStory)
+{
+    char name[32];
+    const char *oEnd;
+
+    if (name_ieq(fname, "VERSION.TXT") || name_ieq(fname, "LABEL.JSON"))
+        return true;
+    if (hasStory && (name_ieq(fname, "STORY.TIM") || name_ieq(fname, "STORY.ULW")))
+        return true;
+
+    for (const char *o = next_obj(photos, photosEnd, &oEnd); o;
+         o = next_obj(oEnd, photosEnd, &oEnd))
+    {
+        if (get_str(o, oEnd, "name", name, sizeof(name)) == 0 &&
+            name_ieq(fname, name))
+            return true;
+    }
+    return false;
+}
+
+/* Delete the album files the manifest no longer lists: photos removed in the
+ * App, a story that was cleared, or leftovers of an earlier trip with the same
+ * id (SQLite reuses ids). Runs on every sync, not only when the version
+ * changes, so a card that already carries leftovers is cleaned too. Collects
+ * names first and deletes after closedir (same rule as remove_album_dir).
+ * Returns files removed. */
+static int prune_album_files(const char *dir, const char *folder,
+                             const char *obj, const char *objEnd)
+{
+    static char stale[16][32];
+    char path[112];
+    const char *aEnd;
+    const char *a = find_array(obj, objEnd, "photos", &aEnd);
+    bool hasStory = get_bool(obj, objEnd, "has_story");
+    int  removed = 0;
+
+    if (!a)
+        return 0;                       /* malformed entry: leave the album alone */
+
+    for (int pass = 0; pass < 8; pass++)
+    {
+        DIR     dj;
+        FILINFO fno;
+        int     nStale = 0, before = removed;
+
+        if (f_opendir(&dj, dir) != FR_OK)
+            break;
+        while (nStale < 16 && f_readdir(&dj, &fno) == FR_OK && fno.fname[0])
+        {
+            if ((fno.fattrib & AM_DIR) ||
+                album_file_wanted(fno.fname, a, aEnd, hasStory) ||
+                strlen(fno.fname) >= sizeof(stale[0]))
+                continue;
+            strcpy(stale[nStale++], fno.fname);
+        }
+        f_closedir(&dj);
+
+        for (int i = 0; i < nStale; i++)
+        {
+            snprintf(path, sizeof(path), "%s\\%s", dir, stale[i]);
+            if (f_unlink(path) == FR_OK)
+            {
+                printf("[SYNC] album %s: removed %s (no longer in the trip)\n",
+                       folder, stale[i]);
+                removed++;
+            }
+        }
+        if (nStale < 16 || removed == before)
+            break;                      /* all seen, or nothing deletable */
+    }
+    return removed;
+}
+
+/* Returns 1 if the album was (re)downloaded or cleaned, 0 if up to date /
+ * unusable. */
 static int sync_trip(const char *obj, const char *objEnd,
                      const char *sdRoot, bool verbose)
 {
@@ -526,7 +617,7 @@ static int sync_trip(const char *obj, const char *objEnd,
 
     snprintf(dir, sizeof(dir), "0:\\%s\\%s", sdRoot, folder);
     if (version_matches(dir, ver))
-        return 0;
+        return (prune_album_files(dir, folder, obj, objEnd) > 0) ? 1 : 0;
 
     printf("[SYNC] album %s: updating\n", folder);
     if (verbose)
@@ -577,6 +668,8 @@ static int sync_trip(const char *obj, const char *objEnd,
             if (dl_to_file(url, sdPath) != 0) fails++;
         }
     }
+
+    prune_album_files(dir, folder, obj, objEnd);
 
     if (fails == 0)
         version_write(dir, ver);        /* only a complete album gets a version */
