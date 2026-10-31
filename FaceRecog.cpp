@@ -14,6 +14,7 @@
 #include <algorithm>
 
 #include "NuMicro.h"
+#include "PerfTimer.h"              /* GetSystemTick_us */
 #include "ff.h"
 
 #include "MemoryLayout.h"          /* FACE_MODEL_ADDR, MODEL_SLOT_SIZE */
@@ -58,6 +59,13 @@ static bool          s_ready   = false;
 static int           s_inCols  = 0, s_inRows = 0;
 static TfLiteTensor *s_in      = nullptr;
 static TfLiteTensor *s_out     = nullptr;
+
+/* Last FaceRecog_Run stats (FaceRecog_GetLastStats). */
+static uint32_t      s_lastEmbedUs = 0, s_lastInferUs = 0, s_lastMatchUs = 0;
+static float         s_lastScore   = -1.0f;
+static char          s_lastBest[32] = "";
+static float         s_lastSecond  = -1.0f;
+static char          s_lastSecondLabel[32] = "";
 
 extern "C" void FaceRecog_GetArena(void **base, uint32_t *size)
 {
@@ -150,7 +158,10 @@ static bool run_embedding(const uint16_t *frame, int fw, int fh, const FaceBox *
     for (size_t i = 0; i < s_in->bytes; i++)
         s[i] = static_cast<int8_t>((int)u[i] - 128);
 
-    return s_model.RunInference();
+    uint32_t t0 = GetSystemTick_us();
+    bool ok = s_model.RunInference();
+    s_lastInferUs = GetSystemTick_us() - t0;
+    return ok;
 }
 
 /* Dequantise the output tensor into a float embedding (mirrors Recognizer). */
@@ -193,16 +204,35 @@ static void draw_rect(uint16_t *fb, int W, int H,
 extern "C" int FaceRecog_Run(uint16_t *frame, int fw, int fh, const FaceBox *box)
 {
     if (!s_ready) return -1;
+    s_lastScore   = -1.0f;
+    s_lastBest[0] = '\0';
+    s_lastSecond  = -1.0f;
+    s_lastSecondLabel[0] = '\0';
+    s_lastMatchUs = 0;
+
+    uint32_t t0 = GetSystemTick_us();
     if (!run_embedding(frame, fw, fh, box))
     {
         printf("[FACEREC] inference failed\n");
         return -2;
     }
+    s_lastEmbedUs = GetSystemTick_us() - t0;
 
     arm::app::RecognitionResult result;
     bool ok = false;
+    t0 = GetSystemTick_us();
     if (!s_labels.empty())
         ok = s_recognizer.GetRecognitionResults(s_out, result, s_labels);
+    s_lastMatchUs = GetSystemTick_us() - t0;
+    if (!s_labels.empty())
+    {
+        s_lastScore = result.m_predict;
+        strncpy(s_lastBest, result.m_label.c_str(), sizeof(s_lastBest) - 1);
+        s_lastBest[sizeof(s_lastBest) - 1] = '\0';
+        s_lastSecond = result.m_second;
+        strncpy(s_lastSecondLabel, result.m_secondLabel.c_str(), sizeof(s_lastSecondLabel) - 1);
+        s_lastSecondLabel[sizeof(s_lastSecondLabel) - 1] = '\0';
+    }
 
     if (ok && result.m_recognize)
     {
@@ -232,6 +262,19 @@ extern "C" int FaceRecog_Run(uint16_t *frame, int fw, int fh, const FaceBox *box
 extern "C" const char *FaceRecog_GetLabel(void)
 {
     return s_lastLabel;
+}
+
+extern "C" void FaceRecog_GetLastStats(uint32_t *embedUs, uint32_t *inferUs,
+                                       uint32_t *matchUs, float *score, const char **best,
+                                       float *second, const char **secondLabel)
+{
+    if (embedUs) *embedUs = s_lastEmbedUs;
+    if (inferUs) *inferUs = s_lastInferUs;
+    if (matchUs) *matchUs = s_lastMatchUs;
+    if (score)   *score   = s_lastScore;
+    if (best)    *best    = s_lastBest;
+    if (second)  *second  = s_lastSecond;
+    if (secondLabel) *secondLabel = s_lastSecondLabel;
 }
 
 extern "C" int FaceRecog_Enroll(uint16_t *frame, int fw, int fh,

@@ -191,6 +191,18 @@
 #define VOICE_PAUSE_MAX_MS  (600000) /* 「停在這張」 holds at most this long, */
                                      /* so the frame can't stay stuck         */
 
+/* Test branch only: per-frame pipeline timing + cosine log to PERF_LOG_FILE.
+ * 0 = off (main behaviour).
+ * 1 = timing: normal demo behaviour (lock included), every hold-loop frame
+ *     logs per-stage us. Gives latency / FPS as the demo really runs.
+ * 2 = score collection: lock disabled so recognition runs on EVERY frame
+ *     (genuine/impostor cosine for FAR/FRR); the button only bumps the `seg`
+ *     column so each test condition (light / angle / person) is separable.
+ * Rows are buffered in RAM and appended to the SD every ~40 rows, so a power
+ * cut loses at most the last few seconds. Each boot writes a "# boot" line. */
+#define RUN_PERF_LOG       (2)
+#define PERF_LOG_FILE      "0:\\perf.csv"
+
 /* 1 = compile + run the Day-1 validation tests (and their whole UART log)
  *     whenever the slideshow doesn't take over.
  * 0 = Day-1 is signed off (see final_report.md): test code, boot log, tensor
@@ -966,6 +978,100 @@ static uint32_t Voice_Ask(void)
 static bool Voice_Paused(void) { return false; }
 #endif /* RUN_VOICE_CHAT */
 
+#if RUN_PERF_LOG
+/*----------------------------------------------------------------------------
+ * Perf log (test branch). One CSV row per hold-loop frame:
+ *   ms        boot time at frame start
+ *   seg       button-press counter (mode 2) — condition marker
+ *   locked    1 = recognition skipped this frame (lock held)
+ *   cap       Camera_Capture                  us
+ *   gest      GestureLike_Run (whole)         us
+ *   det       FaceDetect_Run (pre+NPU+NMS+draw) us
+ *   det_npu   detection RunInference only     us
+ *   nface     faces after NMS (-1 = not run)
+ *   rec       FaceRecog_Run (whole, incl. its printf) us
+ *   emb       crop/resize + embedding RunInference us
+ *   emb_npu   embedding RunInference only     us
+ *   match     dequant + cosine over all refs  us
+ *   blit      Camera_Blit                     us
+ *   loop      whole frame (cap .. blit)       us
+ *   flush     SD write of the previous batch  us (0 on most rows)
+ *   score     best person score = mean of top-3 cosine (-1 = not run)
+ *   best      that person (even when rejected)
+ *   second    runner-up person score (-1 = only one person enrolled)
+ *   second_label  runner-up person
+ *   hit       1 = recognised (FaceRecog_Run returned 1: above threshold
+ *             AND leading the runner-up by the margin)
+ *   filter    active album filter ("" = play all)
+ *--------------------------------------------------------------------------*/
+typedef struct
+{
+    uint32_t ms, cap, gest, det, detNpu, rec, emb, embNpu, match, blit, loop;
+    int      locked, nface, hit;
+    float    score, second;
+    const char *best, *secondLabel;
+} PerfRow;
+
+static char     s_perfBuf[4096];
+static int      s_perfLen    = 0;
+static int      s_perfSeg    = 0;
+static uint32_t s_perfFlush  = 0;     /* us of the last flush, logged once */
+static bool     s_perfBooted = false;
+
+static void PerfLog_Flush(void)
+{
+    if (s_perfLen == 0) return;
+
+    uint32_t t0 = GetSystemTick_us();
+    FIL  fil;
+    UINT bw;
+    if (f_open(&fil, PERF_LOG_FILE, FA_WRITE | FA_OPEN_APPEND) == FR_OK)
+    {
+        if (f_size(&fil) == 0)
+        {
+            static const char hdr[] =
+                "ms,seg,locked,cap,gest,det,det_npu,nface,rec,emb,emb_npu,"
+                "match,blit,loop,flush,score,best,second,second_label,hit,filter\n";
+            f_write(&fil, hdr, sizeof(hdr) - 1, &bw);
+        }
+        f_write(&fil, s_perfBuf, (UINT)s_perfLen, &bw);
+        f_close(&fil);
+    }
+    else
+        printf("[PERF] cannot open %s\n", PERF_LOG_FILE);
+
+    s_perfLen   = 0;
+    s_perfFlush = GetSystemTick_us() - t0;
+}
+
+static void PerfLog_Push(const PerfRow *r)
+{
+    if (!s_perfBooted)
+    {
+        s_perfBooted = true;
+        s_perfLen += snprintf(s_perfBuf + s_perfLen, sizeof(s_perfBuf) - s_perfLen,
+                              "# boot mode=%d clk=%u\n", RUN_PERF_LOG,
+                              (unsigned)SystemCoreClock);
+    }
+
+    int n = snprintf(s_perfBuf + s_perfLen, sizeof(s_perfBuf) - s_perfLen,
+                     "%u,%d,%d,%u,%u,%u,%u,%d,%u,%u,%u,%u,%u,%u,%u,%.4f,%s,%.4f,%s,%d,%s\n",
+                     (unsigned)r->ms, s_perfSeg, r->locked,
+                     (unsigned)r->cap, (unsigned)r->gest, (unsigned)r->det,
+                     (unsigned)r->detNpu, r->nface, (unsigned)r->rec,
+                     (unsigned)r->emb, (unsigned)r->embNpu, (unsigned)r->match,
+                     (unsigned)r->blit, (unsigned)r->loop, (unsigned)s_perfFlush,
+                     (double)r->score, r->best ? r->best : "",
+                     (double)r->second, r->secondLabel ? r->secondLabel : "", r->hit,
+                     s_filterUser);
+    s_perfFlush = 0;
+    if (n > 0) s_perfLen += n;
+
+    if (s_perfLen > (int)sizeof(s_perfBuf) - 256)
+        PerfLog_Flush();
+}
+#endif /* RUN_PERF_LOG */
+
 /*----------------------------------------------------------------------------
  * main
  *--------------------------------------------------------------------------*/
@@ -1296,7 +1402,13 @@ int main(void)
                      * exactly when somebody is standing in front of the frame,
                      * ready to thumbs-up the photo. */
                     bool locked = false;
-#if RUN_FACE_DETECT && RUN_FACE_RECOG && !RUN_FACE_ENROLL
+#if RUN_PERF_LOG == 2
+                    if (btn & BUTTON_BTN1)      /* BTN1 = condition marker */
+                    {
+                        s_perfSeg++;
+                        printf("[PERF] seg -> %d\n", s_perfSeg);
+                    }
+#elif RUN_FACE_DETECT && RUN_FACE_RECOG && !RUN_FACE_ENROLL
                     locked = SlideFilter_IsLocked();
 
                     if (locked)
@@ -1332,11 +1444,25 @@ int main(void)
                     (void)locked;
                     if (camOk)
                     {
+#if RUN_PERF_LOG
+                        PerfRow pr = {};
+                        pr.ms     = GetSystemTick_ms();
+                        pr.locked = locked;
+                        pr.nface  = -1;
+                        pr.score  = -1.0f;
+                        pr.second = -1.0f;
+                        uint32_t ptLoop = GetSystemTick_us(), pt = ptLoop;
+#define PERF_MARK(field) do { uint32_t _n = GetSystemTick_us(); \
+                              pr.field = _n - pt; pt = _n; } while (0)
+#else
+#define PERF_MARK(field) do { } while (0)
+#endif
                         if (Camera_Capture() != 0)
                         {
                             camOk = false;      /* capture died: stop trying */
                             continue;
                         }
+                        PERF_MARK(cap);
 
                         uint16_t *frame = (uint16_t *)Camera_GetFrame();
 
@@ -1345,13 +1471,24 @@ int main(void)
                          * boxes are drawn into it by FaceDetect_Run below). */
                         if (glOk)
                             LikeGesture_Update(GestureLike_Run(frame, CAM_W, CAM_H));
+                        PERF_MARK(gest);
 #endif
 
 #if RUN_FACE_DETECT
 #if RUN_FACE_RECOG && !RUN_FACE_ENROLL
                         const char *seenUser = NULL;
 #endif
-                        if (fdOk && !locked && FaceDetect_Run(frame, CAM_W, CAM_H) > 0)
+                        int nFace = 0;
+                        if (fdOk && !locked)
+                        {
+                            nFace = FaceDetect_Run(frame, CAM_W, CAM_H);
+#if RUN_PERF_LOG
+                            PERF_MARK(det);
+                            pr.detNpu = FaceDetect_GetLastInferUs();
+                            pr.nface  = nFace;
+#endif
+                        }
+                        if (nFace > 0)
                         {
                             FaceBox tb;
                             if (FaceDetect_GetTopBox(&tb))
@@ -1365,8 +1502,19 @@ int main(void)
                                         printf("[ENROLL] captured %d samples — done\n", ENROLL_SAMPLES);
                                 }
 #else
-                                if (frOk && FaceRecog_Run(frame, CAM_W, CAM_H, &tb) == 1)
+                                int rr = frOk ? FaceRecog_Run(frame, CAM_W, CAM_H, &tb) : -1;
+                                if (rr == 1)
                                     seenUser = FaceRecog_GetLabel();
+#if RUN_PERF_LOG
+                                PERF_MARK(rec);
+                                if (rr >= 0)
+                                {
+                                    FaceRecog_GetLastStats(&pr.emb, &pr.embNpu, &pr.match,
+                                                           &pr.score, &pr.best,
+                                                           &pr.second, &pr.secondLabel);
+                                    pr.hit = (rr == 1);
+                                }
+#endif
 #endif
 #endif
                             }
@@ -1376,9 +1524,18 @@ int main(void)
                             SlideFilter_Update(seenUser);
 #endif
 #endif
+#if RUN_PERF_LOG
+                        pt = GetSystemTick_us();   /* skip SlideFilter bookkeeping */
+#endif
 #if SHOW_CAMERA_PREVIEW
                         Camera_Blit(camX, camY);
 #endif
+#if RUN_PERF_LOG
+                        PERF_MARK(blit);
+                        pr.loop = GetSystemTick_us() - ptLoop;
+                        PerfLog_Push(&pr);
+#endif
+#undef PERF_MARK
                         continue;
                     }
 #endif

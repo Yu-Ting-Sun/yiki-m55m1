@@ -56,6 +56,9 @@ int FaceDetect_Run(uint16_t *frameRGB565, int w, int h);
  */
 int FaceDetect_GetTopBox(FaceBox *out);
 
+/** @brief  NPU-only time (RunInference) of the most recent FaceDetect_Run, us. */
+uint32_t FaceDetect_GetLastInferUs(void);
+
 /**
  * @brief  Expose the detection tensor arena so the caller can set the arena
  *         MPU policy for all app arenas in one InitPreDefMPURegion() call.

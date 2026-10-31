@@ -18,6 +18,7 @@
 #include <algorithm>
 
 #include "NuMicro.h"
+#include "PerfTimer.h"                  /* GetSystemTick_us */
 #include "mpu_config_M55M1.h"          /* eMPU_ATTR_CACHEABLE_WTRA */
 
 #include "NNModel.hpp"                 /* interpreter + extern anchor1/anchor2 */
@@ -53,6 +54,7 @@ static int           s_inCols = 0, s_inRows = 0;   /* model input W, H */
 static TfLiteTensor *s_in   = nullptr;
 static TfLiteTensor *s_out0 = nullptr;
 static TfLiteTensor *s_out1 = nullptr;
+static uint32_t      s_lastInferUs = 0;
 
 /* Post-processor is built lazily on the first Run (it needs the frame size);
  * it holds a const ref to s_ppParams, so both must be static and outlive it. */
@@ -169,7 +171,10 @@ extern "C" int FaceDetect_Run(uint16_t *frameRGB565, int w, int h)
 
     preprocess(frameRGB565, w, h);
 
-    if (!s_model.RunInference())
+    uint32_t t0 = GetSystemTick_us();
+    bool inferOk = s_model.RunInference();
+    s_lastInferUs = GetSystemTick_us() - t0;
+    if (!inferOk)
     {
         printf("[FACEDET] RunInference failed\n");
         return -2;
@@ -184,6 +189,11 @@ extern "C" int FaceDetect_Run(uint16_t *frameRGB565, int w, int h)
                   FACEDET_BOX_COLOR, FACEDET_BOX_THICK);
 
     return (int)s_results.size();
+}
+
+extern "C" uint32_t FaceDetect_GetLastInferUs(void)
+{
+    return s_lastInferUs;
 }
 
 extern "C" int FaceDetect_GetTopBox(FaceBox *out)

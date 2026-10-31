@@ -50,6 +50,18 @@ int FaceRecog_Run(uint16_t *frame, int fw, int fh, const FaceBox *box);
 const char *FaceRecog_GetLabel(void);
 
 /**
+ * @brief  Stats of the most recent FaceRecog_Run (any outcome):
+ *         embedUs = crop/resize + RunInference, inferUs = RunInference only,
+ *         matchUs = dequantise + cosine over all references, score = best
+ *         person score (-1 if no reference), best = that person even when
+ *         rejected ("" if none), second / secondLabel = runner-up person
+ *         (-1 / "" if only one person). Any pointer may be NULL.
+ */
+void FaceRecog_GetLastStats(uint32_t *embedUs, uint32_t *inferUs,
+                            uint32_t *matchUs, float *score, const char **best,
+                            float *second, const char **secondLabel);
+
+/**
  * @brief  Compute the embedding for the face in `box` and append
  *         "label:e0,e1,...\n" to 0:\faces\embeddings.txt.
  * @return 0 on success; negative on inference / SD-write failure.
